@@ -1,3 +1,10 @@
+#define NEWLIB_PORT_AWARE
+#include <kernel.h>
+#include <sifrpc.h>
+#include <loadfile.h>
+#include <iopcontrol.h>
+#include <sbv_patches.h>
+#include <fileXio_rpc.h>
 #include <kernel.h>
 #include <sifrpc.h>
 #include <loadfile.h>
