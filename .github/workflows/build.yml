@@ -1,0 +1,23 @@
+name: Build ELF
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: ps2dev/ps2dev:latest   # тот же образ с PS2SDK и gsKit
+    steps:
+      - name: Install tools
+        run: apk add --no-cache build-base git make
+
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: make
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: launcher-elf
+          path: launcher.elf
