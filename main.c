@@ -49,8 +49,8 @@ typedef struct {
     Anim scale;
 } Game;
 
-typedef struct { int video, wide, debug, argv0, cwd; } Config;
-static Config cfg = { 0, 1, 1, 0, 0 };   /* video: 0 auto, 1 ntsc, 2 pal, 3 480p */
+typedef struct { int video, wide, debug, argv0, cwd, slash; char extra[64], extra2[64]; } Config;
+static Config cfg = { 0, 1, 1, 0, 0, 0, "", "" };   /* video: 0 auto, 1 ntsc, 2 pal, 3 480p */
 
 static GSGLOBAL *gs;
 static GSFONTM  *font;
@@ -111,9 +111,9 @@ static int select_held(void) {              /* SELECT при запуске = б
 static void load_cfg(void) {
     FILE *f = fopen(CFG_PATH, "r");
     if (!f) return;
-    char line[128], key[32], val[32];
+    char line[160], key[32], val[64];
     while (fgets(line, sizeof line, f)) {
-        if (sscanf(line, " %31[^= \t#] = %31s", key, val) != 2) continue;
+        if (sscanf(line, " %31[^= \t#] = %63s", key, val) != 2) continue;
         if (!strcasecmp(key, "video"))
             cfg.video = !strcasecmp(val, "ntsc") ? 1 : !strcasecmp(val, "pal") ? 2 :
                         !strcasecmp(val, "480p") ? 3 : 0;
@@ -121,6 +121,9 @@ static void load_cfg(void) {
         else if (!strcasecmp(key, "debug"))      cfg.debug = atoi(val);
         else if (!strcasecmp(key, "argv0"))      cfg.argv0 = atoi(val);
         else if (!strcasecmp(key, "cwd"))        cfg.cwd   = atoi(val);
+        else if (!strcasecmp(key, "slash"))  cfg.slash = atoi(val);
+        else if (!strcasecmp(key, "extra"))  snprintf(cfg.extra,  sizeof cfg.extra,  "%s", val);
+        else if (!strcasecmp(key, "extra2")) snprintf(cfg.extra2, sizeof cfg.extra2, "%s", val);
     }
     fclose(f);
 }
@@ -314,7 +317,8 @@ static void launch(const Game *g) {
     static char a_dvd[220], a_cwd[64], iso[200];
     static char *args[8];
     int n = 0;
-    snprintf(a_dvd, sizeof a_dvd, "-dvd=mass:%s", g->rel);
+    if (cfg.slash) snprintf(a_dvd, sizeof a_dvd, "-dvd=mass:/%s", g->rel);
+    else           snprintf(a_dvd, sizeof a_dvd, "-dvd=mass:%s",  g->rel);
     snprintf(a_cwd, sizeof a_cwd, "-cwd=%s", NEU_DIR);
     snprintf(iso,   sizeof iso,   ROOT "%s", g->rel);
     if (cfg.argv0) args[n++] = NEU_ELF;
@@ -322,6 +326,8 @@ static void launch(const Game *g) {
     args[n++] = a_dvd;
     args[n++] = g->is_cd ? "-mt=cd" : "-mt=dvd";
     if (cfg.cwd) args[n++] = a_cwd;
+    if (cfg.extra[0])  args[n++] = cfg.extra;
+    if (cfg.extra2[0]) args[n++] = cfg.extra2;
 
     int okElf = exists_file(NEU_ELF);
     int okMod = exists_dir(NEU_DIR "/modules");
