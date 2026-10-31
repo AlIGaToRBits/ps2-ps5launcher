@@ -345,6 +345,7 @@ static int exists_file(const char *p) { FILE *f = fopen(p, "rb"); if (!f) return
 static int exists_dir(const char *p)  { DIR *d = opendir(p); if (!d) return 0; closedir(d); return 1; }
 
 /* ---------- Запуск через Neutrino ---------- */
+#define NHDDL_ELF NEU_DIR "/nhddl.elf"
 
 static int t_argv0 = -1, t_qb = 1, t_slash = 0;
 static int t_nhddl = 0, t_unit = 0, t_noinit = 0;
