@@ -108,26 +108,59 @@ static int select_held(void) {              /* SELECT при запуске = б
 }
 
 /* ---------- Настройки ---------- */
-static void load_cfg(void) {
-    FILE *f = fopen(CFG_PATH, "r");
-    if (!f) return;
+static char self_path[120] = "(none)";
+static char cfg_msg[64]    = "cfg: not loaded";
+
+static void set_self(int argc, char *argv[]) {
+    if (argc > 0 && argv && argv[0])
+        snprintf(self_path, sizeof self_path, "%s", argv[0]);
+}
+
+static int parse_cfg(FILE *f) {
     char line[160], key[32], val[64];
+    int n = 0;
     while (fgets(line, sizeof line, f)) {
-        if (sscanf(line, " %31[^= \t#] = %63s", key, val) != 2) continue;
+        char *p = line;
+        if ((unsigned char)p[0] == 0xEF && (unsigned char)p[1] == 0xBB && (unsigned char)p[2] == 0xBF)
+            p += 3;                                   /* пропустить BOM */
+        if (sscanf(p, " %31[^= \t#] = %63s", key, val) != 2) continue;
+        n++;
         if (!strcasecmp(key, "video"))
-            cfg.video = !strcasecmp(val, "ntsc") ? 1 : !strcasecmp(val, "pal") ? 2 :
-                        !strcasecmp(val, "480p") ? 3 : 0;
+            cfg.video = !strcasecmp(val, "ntsc") ? 1 : !strcasecmp(val, "pal") ? 2 : !strcasecmp(val, "480p") ? 3 : 0;
         else if (!strcasecmp(key, "widescreen")) cfg.wide  = atoi(val);
         else if (!strcasecmp(key, "debug"))      cfg.debug = atoi(val);
         else if (!strcasecmp(key, "argv0"))      cfg.argv0 = atoi(val);
         else if (!strcasecmp(key, "cwd"))        cfg.cwd   = atoi(val);
-        else if (!strcasecmp(key, "slash"))  cfg.slash = atoi(val);
-        else if (!strcasecmp(key, "extra"))  snprintf(cfg.extra,  sizeof cfg.extra,  "%s", val);
-        else if (!strcasecmp(key, "extra2")) snprintf(cfg.extra2, sizeof cfg.extra2, "%s", val);
+        else if (!strcasecmp(key, "slash"))      cfg.slash = atoi(val);
+        else if (!strcasecmp(key, "extra"))      snprintf(cfg.extra,  sizeof cfg.extra,  "%s", val);
+        else if (!strcasecmp(key, "extra2"))     snprintf(cfg.extra2, sizeof cfg.extra2, "%s", val);
     }
-    fclose(f);
+    return n;
 }
+    set_self(argc, argv);
+static void load_cfg(void) {
+    char cand[3][128];
+    int opened = 0, got = 0, which = -1;
 
+    snprintf(cand[0], sizeof cand[0], "%s", CFG_PATH);          /* mass:/APPS/PS5L/launcher.cfg */
+    cand[1][0] = 0;
+    char *sl = strrchr(self_path, '/');                          /* рядом с запущенным ELF */
+    if (sl) snprintf(cand[1], sizeof cand[1], "%.*slauncher.cfg", (int)(sl - self_path + 1), self_path);
+    snprintf(cand[2], sizeof cand[2], "%slauncher.cfg", ROOT);   /* корень флешки */
+
+    for (int i = 0; i < 3; i++) {
+        if (!cand[i][0]) continue;
+        FILE *f = fopen(cand[i], "r");
+        if (!f) continue;
+        opened++;
+        int n = parse_cfg(f);
+        fclose(f);
+        if (n) { got = n; which = i; break; }
+    }
+    if (got)         snprintf(cfg_msg, sizeof cfg_msg, "cfg: OK, %d keys, path %d", got, which);
+    else if (opened) snprintf(cfg_msg, sizeof cfg_msg, "cfg: opened, 0 keys read");
+    else             snprintf(cfg_msg, sizeof cfg_msg, "cfg: NOT FOUND (3 paths)");
+}
 /* ---------- Графика ---------- */
 static void gfx_init(void) {
     gs = gsKit_init_global();
@@ -313,47 +346,67 @@ static int exists_file(const char *p) { FILE *f = fopen(p, "rb"); if (!f) return
 static int exists_dir(const char *p)  { DIR *d = opendir(p); if (!d) return 0; closedir(d); return 1; }
 
 /* ---------- Запуск через Neutrino ---------- */
-static void launch(const Game *g) {
-    static char a_dvd[220], a_cwd[64], iso[200];
-    static char *args[8];
+static int t_argv0 = -1, t_qb = 1, t_mt = 0, t_slash = 0;   /* t_argv0 = -1: взять из cfg при первом запуске */
+
+static int build_args(const Game *g, char **args) {
+    static char a_dvd[220], a_cwd[64];
     int n = 0;
-    if (cfg.slash) snprintf(a_dvd, sizeof a_dvd, "-dvd=mass:/%s", g->rel);
-    else           snprintf(a_dvd, sizeof a_dvd, "-dvd=mass:%s",  g->rel);
+    snprintf(a_dvd, sizeof a_dvd, t_slash ? "-dvd=mass:/%s" : "-dvd=mass:%s", g->rel);
     snprintf(a_cwd, sizeof a_cwd, "-cwd=%s", NEU_DIR);
-    snprintf(iso,   sizeof iso,   ROOT "%s", g->rel);
-    if (cfg.argv0) args[n++] = NEU_ELF;
+    if (t_argv0) args[n++] = NEU_ELF;
     args[n++] = "-bsd=usb";
     args[n++] = a_dvd;
-    args[n++] = g->is_cd ? "-mt=cd" : "-mt=dvd";
+    if (t_qb)    args[n++] = "-qb";
+    if (t_mt)    args[n++] = g->is_cd ? "-mt=cd" : "-mt=dvd";
     if (cfg.cwd) args[n++] = a_cwd;
     if (cfg.extra[0])  args[n++] = cfg.extra;
     if (cfg.extra2[0]) args[n++] = cfg.extra2;
+    return n;
+}
 
-    int okElf = exists_file(NEU_ELF);
-    int okMod = exists_dir(NEU_DIR "/modules");
-    int okCfg = exists_dir(NEU_DIR "/config");
-    int okIso = exists_file(iso);
+static void launch(const Game *g) {
+    static char *args[10];
+    static char iso[200];
+    if (t_argv0 < 0) { t_argv0 = cfg.argv0; t_slash = cfg.slash; }
 
-    if (cfg.debug || !(okElf && okMod && okCfg && okIso)) {
-        char l[16][100];
-        const char *lp[16];
-        int k = 0;
-        snprintf(l[k++], 100, "LAUNCH CHECK");
-        snprintf(l[k++], 100, "neutrino.elf : %s", okElf ? "OK" : "NOT FOUND");
-        snprintf(l[k++], 100, "modules/     : %s", okMod ? "OK" : "NOT FOUND");
-        snprintf(l[k++], 100, "config/      : %s", okCfg ? "OK" : "NOT FOUND");
-        snprintf(l[k++], 100, "ISO          : %s", okIso ? "OK" : "NOT FOUND");
-        snprintf(l[k++], 100, "argv0=%d  cwd=%d", cfg.argv0, cfg.cwd);
-        for (int i = 0; i < n; i++) snprintf(l[k++], 100, "arg%d: %.80s", i, args[i]);
-        snprintf(l[k++], 100, "(X) Launch     (O) Back");
-        for (int i = 0; i < k; i++) lp[i] = l[i];
+    snprintf(iso, sizeof iso, ROOT "%s", g->rel);
+    int n = build_args(g, args);
 
+    int okElf  = exists_file(NEU_ELF);
+    int okMod  = exists_dir(NEU_DIR "/modules");
+    int okCfgD = exists_dir(NEU_DIR "/config");
+    int okIso  = exists_file(iso);
+
+    if (cfg.debug || !(okElf && okMod && okCfgD && okIso)) {
         u32 prev = 0xFFFF;
         for (;;) {
+            char l[16][100];
+            const char *lp[16];
+            int k = 0;
+            n = build_args(g, args);
+
+            snprintf(l[k++], 100, "LAUNCH CHECK   build 3");
+            snprintf(l[k++], 100, "elf %s  mod %s  conf %s  iso %s",
+                     okElf ? "OK" : "NO", okMod ? "OK" : "NO", okCfgD ? "OK" : "NO", okIso ? "OK" : "NO");
+            snprintf(l[k++], 100, "run: %.40s", self_path);
+            snprintf(l[k++], 100, "%s", cfg_msg);
+            snprintf(l[k++], 100, "argv0=%d  qb=%d  mt=%d  slash=%d", t_argv0, t_qb, t_mt, t_slash);
+            for (int i = 0; i < n && k < 13; i++)
+                snprintf(l[k++], 100, "arg%d: %.50s", i, args[i]);
+            snprintf(l[k++], 100, "SQUARE argv0  TRI qb  R1 mt  L1 slash");
+            snprintf(l[k++], 100, "(X) Launch     (O) Back");
+            for (int i = 0; i < k; i++) lp[i] = l[i];
+
             info_screen(lp, k);
-            u32 b = read_buttons(), p = b & ~prev;
+
+            u32 b = read_buttons();
+            u32 p = b & ~prev;
             prev = b;
-            if (p & PAD_CROSS) break;
+            if (p & PAD_SQUARE)   t_argv0 ^= 1;
+            if (p & PAD_TRIANGLE) t_qb    ^= 1;
+            if (p & PAD_R1)       t_mt    ^= 1;
+            if (p & PAD_L1)       t_slash ^= 1;
+            if (p & PAD_CROSS)  break;
             if (p & PAD_CIRCLE) return;
         }
     }
@@ -362,13 +415,12 @@ static void launch(const Game *g) {
     padEnd();
     LoadELFFromFile(NEU_ELF, n, args);
 
-    /* Сюда попадаем, только если ELF не запустился */
+    /* сюда попадаем, только если запуск не удался */
     padInit(0);
     padPortOpen(0, 0, padBuf);
     const char *err[] = { "LoadELFFromFile FAILED", "Check " NEU_ELF };
     for (int i = 0; i < 240; i++) info_screen(err, 2);
 }
-
 /* ---------- Главный цикл ---------- */
 int main(int argc, char *argv[]) {
     iop_init();
