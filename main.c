@@ -137,7 +137,6 @@ static int parse_cfg(FILE *f) {
     }
     return n;
 }
-    set_self(argc, argv);
 static void load_cfg(void) {
     char cand[3][128];
     int opened = 0, got = 0, which = -1;
@@ -422,10 +421,11 @@ static void launch(const Game *g) {
     for (int i = 0; i < 240; i++) info_screen(err, 2);
 }
 /* ---------- Главный цикл ---------- */
-int main(int argc, char *argv[]) {
+   int main(int argc, char *argv[]) {
     iop_init();
     padInit(0);
     padPortOpen(0, 0, padBuf);
+       set_self(argc, argv);
     load_cfg();
     if (select_held()) cfg.video = 0;
     gfx_init();
