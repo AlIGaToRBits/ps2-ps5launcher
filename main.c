@@ -345,18 +345,37 @@ static int exists_file(const char *p) { FILE *f = fopen(p, "rb"); if (!f) return
 static int exists_dir(const char *p)  { DIR *d = opendir(p); if (!d) return 0; closedir(d); return 1; }
 
 /* ---------- Запуск через Neutrino ---------- */
-static int t_argv0 = -1, t_qb = 1, t_mt = 0, t_slash = 0;   /* t_argv0 = -1: взять из cfg при первом запуске */
+
+static int t_argv0 = -1, t_qb = 1, t_slash = 0;
+static int t_nhddl = 0, t_unit = 0, t_noinit = 0;
+
+static const char *no_dev(const char *p) {          /* "mass:/neutrino/x" -> "/neutrino/x" */
+    const char *c = strchr(p, ':');
+    return c ? c + 1 : p;
+}
 
 static int build_args(const Game *g, char **args) {
-    static char a_dvd[220], a_cwd[64];
+    static char a_dvd[220], a_cwd[64], a_elf[100];
+    const char *dev  = t_unit  ? "mass0:" : "mass:";
+    const char *sl   = t_slash ? "/" : "";
+    const char *self = no_dev(t_nhddl ? NHDDL_ELF : NEU_ELF);
     int n = 0;
-    snprintf(a_dvd, sizeof a_dvd, t_slash ? "-dvd=mass:/%s" : "-dvd=mass:%s", g->rel);
+
+    snprintf(a_elf, sizeof a_elf, "%s%s%s", dev, self[0] == '/' ? "" : "/", self);
+    snprintf(a_dvd, sizeof a_dvd, "-dvd=%s%s%s", dev, sl, g->rel);
     snprintf(a_cwd, sizeof a_cwd, "-cwd=%s", NEU_DIR);
-    if (t_argv0) args[n++] = NEU_ELF;
+
+    if (t_nhddl) {                                   /* запуск через NHDDL (forward boot) */
+        args[n++] = a_elf;
+        args[n++] = "-mode=usb";
+        args[n++] = a_dvd;
+        if (t_noinit) args[n++] = "-noinit";
+        return n;
+    }
+    if (t_argv0) args[n++] = a_elf;                  /* запуск Neutrino напрямую */
     args[n++] = "-bsd=usb";
     args[n++] = a_dvd;
     if (t_qb)    args[n++] = "-qb";
-    if (t_mt)    args[n++] = g->is_cd ? "-mt=cd" : "-mt=dvd";
     if (cfg.cwd) args[n++] = a_cwd;
     if (cfg.extra[0])  args[n++] = cfg.extra;
     if (cfg.extra2[0]) args[n++] = cfg.extra2;
@@ -372,6 +391,7 @@ static void launch(const Game *g) {
     int n = build_args(g, args);
 
     int okElf  = exists_file(NEU_ELF);
+    int okNh   = exists_file(NHDDL_ELF);
     int okMod  = exists_dir(NEU_DIR "/modules");
     int okCfgD = exists_dir(NEU_DIR "/config");
     int okIso  = exists_file(iso);
@@ -384,15 +404,18 @@ static void launch(const Game *g) {
             int k = 0;
             n = build_args(g, args);
 
-            snprintf(l[k++], 100, "LAUNCH CHECK   build 3");
-            snprintf(l[k++], 100, "elf %s  mod %s  conf %s  iso %s",
-                     okElf ? "OK" : "NO", okMod ? "OK" : "NO", okCfgD ? "OK" : "NO", okIso ? "OK" : "NO");
+            snprintf(l[k++], 100, "LAUNCH CHECK   build 4");
+            snprintf(l[k++], 100, "neu %s  nhddl %s  mod %s  conf %s  iso %s",
+                     okElf ? "OK" : "NO", okNh ? "OK" : "NO", okMod ? "OK" : "NO",
+                     okCfgD ? "OK" : "NO", okIso ? "OK" : "NO");
             snprintf(l[k++], 100, "run: %.40s", self_path);
             snprintf(l[k++], 100, "%s", cfg_msg);
-            snprintf(l[k++], 100, "argv0=%d  qb=%d  mt=%d  slash=%d", t_argv0, t_qb, t_mt, t_slash);
+            snprintf(l[k++], 100, "%s a0=%d qb=%d sl=%d u=%d ni=%d",
+                     t_nhddl ? "NHDDL" : "NEUTRINO", t_argv0, t_qb, t_slash, t_unit, t_noinit);
             for (int i = 0; i < n && k < 13; i++)
                 snprintf(l[k++], 100, "arg%d: %.50s", i, args[i]);
-            snprintf(l[k++], 100, "SQUARE argv0  TRI qb  R1 mt  L1 slash");
+            snprintf(l[k++], 100, "SQ argv0  TRI qb  L1 slash  R2 unit");
+            snprintf(l[k++], 100, "L2 NHDDL/NEU   R1 noinit");
             snprintf(l[k++], 100, "(X) Launch     (O) Back");
             for (int i = 0; i < k; i++) lp[i] = l[i];
 
@@ -401,10 +424,12 @@ static void launch(const Game *g) {
             u32 b = read_buttons();
             u32 p = b & ~prev;
             prev = b;
-            if (p & PAD_SQUARE)   t_argv0 ^= 1;
-            if (p & PAD_TRIANGLE) t_qb    ^= 1;
-            if (p & PAD_R1)       t_mt    ^= 1;
-            if (p & PAD_L1)       t_slash ^= 1;
+            if (p & PAD_SQUARE)   t_argv0  ^= 1;
+            if (p & PAD_TRIANGLE) t_qb     ^= 1;
+            if (p & PAD_L1)       t_slash  ^= 1;
+            if (p & PAD_R2)       t_unit   ^= 1;
+            if (p & PAD_L2)       t_nhddl  ^= 1;
+            if (p & PAD_R1)       t_noinit ^= 1;
             if (p & PAD_CROSS)  break;
             if (p & PAD_CIRCLE) return;
         }
@@ -412,12 +437,12 @@ static void launch(const Game *g) {
 
     padPortClose(0, 0);
     padEnd();
-    LoadELFFromFile(NEU_ELF, n, args);
+    LoadELFFromFile(t_nhddl ? NHDDL_ELF : NEU_ELF, n, args);
 
     /* сюда попадаем, только если запуск не удался */
     padInit(0);
     padPortOpen(0, 0, padBuf);
-    const char *err[] = { "LoadELFFromFile FAILED", "Check " NEU_ELF };
+    const char *err[] = { "LoadELFFromFile FAILED", "Check ELF path" };
     for (int i = 0; i < 240; i++) info_screen(err, 2);
 }
 /* ---------- Главный цикл ---------- */
