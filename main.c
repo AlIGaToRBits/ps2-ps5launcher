@@ -23,6 +23,8 @@
 #include <string.h>
 #include <strings.h>
 #include <math.h>
+#include <malloc.h>
+#include <png.h>
 
 #ifndef HAVE_CDVD
 #define HAVE_CDVD 1
@@ -80,14 +82,18 @@ typedef struct {
     int  tz;                       /* GMT-сдвиг в минутах */
     int  clock24, volume, music_on, fx_on;
     char track[64];
+    int  vtry;                     /* видеорежим на пробу при следующем запуске, -1 = нет */
 } Config;
-/* video: 0 auto, 1 ntsc, 2 pal, 3 480p */
-static Config cfg = { 0, 1, 0, 0, 0, 0, "", "", 1, 180, 1, 80, 1, 1, "" };
+/* video: 0 auto, 1 ntsc, 2 pal, 3 480p, 4 720p, 5 1080i */
+#define NVIDEO 6
+static Config cfg = { 0, 1, 0, 0, 0, 0, "", "", 1, 180, 1, 80, 1, 1, "", -1 };
 
 static GSGLOBAL *gs;
 static GSFONTM  *fontm;
-static GSTEXTURE font_tex, logo_tex, lgo_tex;
+static GSTEXTURE logo_tex, lgo_tex;
 static int   font_ok, logo_ok, lgo_state;
+static int   run_video, trial_on;                    /* видеорежим этого запуска; идёт ли проба режима */
+static float trial_left;
 static Game  games[MAX_GAMES];
 static float tile_x[MAX_GAMES];
 static int   ngames;
@@ -201,9 +207,14 @@ static char *trim(char *s) {
     while (e > s && (e[-1] == ' ' || e[-1] == '\t' || e[-1] == '\r' || e[-1] == '\n')) *--e = 0;
     return s;
 }
+static const char *const VID_KEY[NVIDEO] = { "auto", "ntsc", "pal", "480p", "720p", "1080i" };
+static int parse_video(const char *v) {
+    for (int i = 0; i < NVIDEO; i++) if (!strcasecmp(v, VID_KEY[i])) return i;
+    return 0;
+}
 static void cfg_set(const char *k, const char *v) {
-    if (!strcasecmp(k, "video"))
-        cfg.video = !strcasecmp(v, "ntsc") ? 1 : !strcasecmp(v, "pal") ? 2 : !strcasecmp(v, "480p") ? 3 : 0;
+    if (!strcasecmp(k, "video"))           cfg.video    = parse_video(v);
+    else if (!strcasecmp(k, "video_try"))  cfg.vtry     = parse_video(v);
     else if (!strcasecmp(k, "widescreen")) cfg.wide     = atoi(v);
     else if (!strcasecmp(k, "debug"))      cfg.debug    = atoi(v);
     else if (!strcasecmp(k, "argv0"))      cfg.argv0    = atoi(v);
@@ -255,12 +266,12 @@ static void load_cfg(void) {
     else             snprintf(cfg_msg, sizeof cfg_msg, "cfg: NOT FOUND (defaults)");
 }
 static int save_cfg(void) {
-    static const char *vid[] = { "auto", "ntsc", "pal", "480p" };
     FILE *f = fopen(cfg_path, "w");
     if (!f) return -1;
     fprintf(f, "# PS5L launcher settings\n");
     fprintf(f, "lang=%s\n", cfg.lang ? "ru" : "en");
-    fprintf(f, "video=%s\n", vid[cfg.video & 3]);
+    fprintf(f, "video=%s\n", VID_KEY[cfg.video % NVIDEO]);
+    if (cfg.vtry >= 0) fprintf(f, "video_try=%s\n", VID_KEY[cfg.vtry % NVIDEO]);
     fprintf(f, "widescreen=%d\n", cfg.wide);
     fprintf(f, "tz=%d\n", cfg.tz);
     fprintf(f, "clock24=%d\n", cfg.clock24);
@@ -278,13 +289,6 @@ static int save_cfg(void) {
 }
 
 /* ---------- Графика ---------- */
-static int load_png(GSTEXTURE *t, const char *path) {
-    memset(t, 0, sizeof *t);
-    t->Delayed = 1;
-    if (gsKit_texture_png(gs, t, (char *)path) < 0) { t->Mem = NULL; return -1; }
-    t->Filter = GS_FILTER_LINEAR;
-    return 0;
-}
 static void free_tex(GSTEXTURE *t) {
     if (t->Mem) { gsKit_TexManager_free(gs, t); free(t->Mem); t->Mem = NULL; }
 }
@@ -292,18 +296,218 @@ static void img_path(char *dst, size_t n, const char *name) {
     snprintf(dst, n, "%s/img/%s", app_dir, name);
 }
 
+/* Читает PNG любого вида (палитра, серый, прозрачность tRNS, 16 бит) в RGBA8. */
+static unsigned char *png_decode(const char *path, int *ow, int *oh) {
+    FILE *fp = fopen(path, "rb");
+    unsigned char sig[8];
+    png_structp png;
+    png_infop info;
+    unsigned char *volatile pix = NULL;
+    png_bytep *volatile rows = NULL;
+    png_uint_32 w, h;
+    int depth, ctype;
+    if (!fp) return NULL;
+    if (fread(sig, 1, 8, fp) != 8 || png_sig_cmp(sig, 0, 8)) { fclose(fp); return NULL; }
+    png = png_create_read_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+    info = png ? png_create_info_struct(png) : NULL;
+    if (!png || !info) { png_destroy_read_struct(&png, &info, NULL); fclose(fp); return NULL; }
+    if (setjmp(png_jmpbuf(png))) {
+        png_destroy_read_struct(&png, &info, NULL);
+        free(pix); free(rows); fclose(fp);
+        return NULL;
+    }
+    png_init_io(png, fp);
+    png_set_sig_bytes(png, 8);
+    png_read_info(png, info);
+    png_get_IHDR(png, info, &w, &h, &depth, &ctype, NULL, NULL, NULL);
+    if (!w || !h || w > 4096 || h > 4096) png_error(png, "size");
+    if (depth == 16) png_set_strip_16(png);
+    if (ctype == PNG_COLOR_TYPE_PALETTE) png_set_palette_to_rgb(png);
+    if (ctype == PNG_COLOR_TYPE_GRAY && depth < 8) png_set_expand_gray_1_2_4_to_8(png);
+    if (png_get_valid(png, info, PNG_INFO_tRNS)) png_set_tRNS_to_alpha(png);
+    if (ctype == PNG_COLOR_TYPE_GRAY || ctype == PNG_COLOR_TYPE_GRAY_ALPHA) png_set_gray_to_rgb(png);
+    png_set_filler(png, 0xFF, PNG_FILLER_AFTER);
+    png_set_interlace_handling(png);
+    png_read_update_info(png, info);
+    pix = malloc((size_t)w * h * 4);
+    rows = malloc(h * sizeof(png_bytep));
+    if (!pix || !rows) png_error(png, "mem");
+    for (png_uint_32 i = 0; i < h; i++) rows[i] = pix + (size_t)i * w * 4;
+    png_read_image(png, rows);
+    png_destroy_read_struct(&png, &info, NULL);
+    free(rows);
+    fclose(fp);
+    *ow = (int)w; *oh = (int)h;
+    return pix;
+}
+
+/* PNG -> текстура GS. Большие картинки уменьшаются (экономит видеопамять), square = обрезка до квадрата. */
+static int load_png_ex(GSTEXTURE *t, const char *path, int maxw, int maxh, int square) {
+    int w, h;
+    unsigned char *px = png_decode(path, &w, &h);
+    memset(t, 0, sizeof *t);
+    if (!px) return -1;
+    int cx = 0, cy = 0, cw = w, ch = h;
+    if (square) { cw = ch = (w < h) ? w : h; cx = (w - cw) / 2; cy = (h - ch) / 2; }
+    int dw = cw, dh = ch;
+    if (maxw > 0 && (cw > maxw || ch > maxh)) {
+        float sc = fminf((float)maxw / cw, (float)maxh / ch);
+        dw = (int)(cw * sc + 0.5f); dh = (int)(ch * sc + 0.5f);
+        if (dw < 1) dw = 1;
+        if (dh < 1) dh = 1;
+    }
+    u32 *out = memalign(128, (size_t)dw * dh * 4);
+    if (!out) { free(px); return -1; }
+    float fx = (float)cw / dw, fy = (float)ch / dh;
+    for (int y = 0; y < dh; y++)
+        for (int x = 0; x < dw; x++) {
+            float xa = x * fx, xb = xa + fx, ya = y * fy, yb = ya + fy;
+            float sr = 0, sg = 0, sb = 0, sa = 0, area = 0;
+            for (int sy = (int)ya; sy < (int)ceilf(yb) && sy < ch; sy++) {
+                float wy = fminf((float)(sy + 1), yb) - fmaxf((float)sy, ya);
+                for (int sx = (int)xa; sx < (int)ceilf(xb) && sx < cw; sx++) {
+                    float wgt = (fminf((float)(sx + 1), xb) - fmaxf((float)sx, xa)) * wy;
+                    const unsigned char *p = px + ((size_t)(cy + sy) * w + cx + sx) * 4;
+                    float a = p[3] * wgt;
+                    sr += p[0] * a; sg += p[1] * a; sb += p[2] * a; sa += a; area += wgt;
+                }
+            }
+            unsigned r = 0, g = 0, b = 0, a8 = 0;
+            if (area > 0 && sa > 0) {
+                r = (unsigned)(sr / sa + 0.5f); g = (unsigned)(sg / sa + 0.5f); b = (unsigned)(sb / sa + 0.5f);
+                a8 = (unsigned)(sa / area + 0.5f);
+            }
+            if (r > 255) r = 255;
+            if (g > 255) g = 255;
+            if (b > 255) b = 255;
+            if (a8 > 255) a8 = 255;
+            out[y * dw + x] = ((a8 * 128u + 127u) / 255u << 24) | (b << 16) | (g << 8) | r;   /* альфа GS: 0..0x80 */
+        }
+    free(px);
+    t->Width = dw; t->Height = dh;
+    t->PSM = GS_PSM_CT32;
+    t->Mem = out;
+    t->Clut = NULL; t->Vram = 0; t->VramClut = 0;
+    t->Filter = GS_FILTER_LINEAR;
+    t->Delayed = 1;
+    return 0;
+}
+
+/* ---------- Шрифт: исходный лист 48 px -> атлас под текущий видеорежим ---------- */
+typedef struct { unsigned short x, y; unsigned char w, h; signed char ox, oy; } BGlyph;
+typedef struct { float h; GSTEXTURE tex; BGlyph g[FONT_NGLYPH]; } FontCls;
+static FontCls fcls[2];                       /* 0 = мелкий (17), 1 = средний (22) */
+
+static int bake_class(FontCls *fc, const unsigned char *src, float hv) {
+    const float fx = hv / FONT_SRC_EM * kx, fy = hv / FONT_SRC_EM * ky;     /* физических пикселей на пиксель листа */
+    const int AW = 256, N = (int)FONT_NGLYPH;
+    int order[FONT_NGLYPH], n = 0;
+    memset(fc, 0, sizeof *fc);
+    fc->h = hv;
+    for (int i = 0; i < N; i++) {
+        const FontGlyph *g = &font_glyphs[i];
+        BGlyph *b = &fc->g[i];
+        if (!g->sw || !g->sh) continue;
+        int x0 = (int)floorf(g->xo * fx) - 1, x1 = (int)ceilf((g->xo + g->sw) * fx) + 1;
+        int y0 = (int)floorf(g->yo * fy) - 1, y1 = (int)ceilf((g->yo + g->sh) * fy) + 1;
+        b->ox = (signed char)x0; b->oy = (signed char)y0;
+        b->w = (unsigned char)(x1 - x0); b->h = (unsigned char)(y1 - y0);
+        order[n++] = i;
+    }
+    for (int i = 1; i < n; i++) {             /* по убыванию высоты */
+        int v = order[i], j = i - 1;
+        while (j >= 0 && fc->g[order[j]].h < fc->g[v].h) { order[j + 1] = order[j]; j--; }
+        order[j + 1] = v;
+    }
+    int px = 1, py = 1, rowh = 0;
+    for (int k = 0; k < n; k++) {
+        BGlyph *b = &fc->g[order[k]];
+        if (px + b->w + 1 > AW) { px = 1; py += rowh + 1; rowh = 0; }
+        b->x = (unsigned short)px; b->y = (unsigned short)py;
+        px += b->w + 1;
+        if (b->h > rowh) rowh = b->h;
+    }
+    int used = py + rowh + 1, AH = 64;
+    while (AH < used) AH <<= 1;
+    if (AH > 256) return 0;
+    unsigned char *al = calloc((size_t)AW * AH, 1);
+    if (!al) return 0;
+    for (int k = 0; k < n; k++) {             /* усреднение по площади */
+        const FontGlyph *g = &font_glyphs[order[k]];
+        const BGlyph *b = &fc->g[order[k]];
+        for (int iy = 0; iy < b->h; iy++) {
+            float ya = (b->oy + iy) / fy - g->yo, yb = (b->oy + iy + 1) / fy - g->yo;
+            float yc0 = fmaxf(ya, 0), yc1 = fminf(yb, (float)g->sh);
+            for (int ix = 0; ix < b->w; ix++) {
+                float xa = (b->ox + ix) / fx - g->xo, xb = (b->ox + ix + 1) / fx - g->xo;
+                float xc0 = fmaxf(xa, 0), xc1 = fminf(xb, (float)g->sw), sum = 0;
+                if (xc1 > xc0 && yc1 > yc0)
+                    for (int sy = (int)floorf(yc0); sy < (int)ceilf(yc1); sy++) {
+                        float wy = fminf((float)(sy + 1), yc1) - fmaxf((float)sy, yc0);
+                        const unsigned char *row = src + ((size_t)(g->sy + sy) * FONT_SRC_W + g->sx) * 4 + 3;
+                        for (int sx = (int)floorf(xc0); sx < (int)ceilf(xc1); sx++)
+                            sum += row[sx * 4] * (fminf((float)(sx + 1), xc1) - fmaxf((float)sx, xc0)) * wy;
+                    }
+                float a = sum / ((xb - xa) * (yb - ya) * 255.0f);
+                al[(b->y + iy) * AW + b->x + ix] = (unsigned char)(clampf(a, 0, 1) * 255.0f + 0.5f);
+            }
+        }
+    }
+    if (gs->Interlace == GS_INTERLACED) {     /* вертикальный фильтр 1-2-1 против мерцания чересстрочной развёртки */
+        for (int k = 0; k < n; k++) {
+            const BGlyph *b = &fc->g[order[k]];
+            for (int ix = 0; ix < b->w; ix++) {
+                unsigned char *col = al + b->y * AW + b->x + ix;
+                float p0 = 0, c0 = col[0];
+                for (int iy = 0; iy < b->h; iy++) {
+                    float nx = (iy + 1 < b->h) ? col[(iy + 1) * AW] : 0.0f;
+                    col[iy * AW] = (unsigned char)(0.25f * p0 + 0.5f * c0 + 0.25f * nx + 0.5f);
+                    p0 = c0; c0 = nx;
+                }
+            }
+        }
+    }
+    u32 *mem = memalign(128, (size_t)AW * AH * 4);
+    if (!mem) { free(al); return 0; }
+    for (int i = 0; i < AW * AH; i++) {
+        unsigned a = (unsigned)(al[i] * 1.15f);
+        if (a > 255) a = 255;
+        mem[i] = ((a * 128u + 127u) / 255u << 24) | 0x00FFFFFFu;
+    }
+    free(al);
+    fc->tex.Width = AW; fc->tex.Height = AH;
+    fc->tex.PSM = GS_PSM_CT32;
+    fc->tex.Mem = mem;
+    fc->tex.Filter = GS_FILTER_LINEAR;
+    fc->tex.Delayed = 1;
+    return 1;
+}
+static int font_build_all(const char *path) {
+    int w, h, ok = 0;
+    unsigned char *src = png_decode(path, &w, &h);
+    if (!src) return 0;
+    if (w == FONT_SRC_W && h == FONT_SRC_H)
+        ok = bake_class(&fcls[0], src, 17.0f) && bake_class(&fcls[1], src, 22.0f);
+    free(src);
+    return ok;
+}
+
 static void gfx_init(void) {
     gs = gsKit_init_global();
-    switch (cfg.video) {
+    gs->PSM = GS_PSM_CT24;
+    switch (run_video) {
     case 1: gs->Mode = GS_MODE_NTSC; gs->Interlace = GS_INTERLACED;
             gs->Field = GS_FIELD; gs->Width = 640; gs->Height = 448; break;
     case 2: gs->Mode = GS_MODE_PAL;  gs->Interlace = GS_INTERLACED;
             gs->Field = GS_FIELD; gs->Width = 640; gs->Height = 512; break;
     case 3: gs->Mode = GS_MODE_DTV_480P; gs->Interlace = GS_NONINTERLACED;
             gs->Field = GS_FRAME; gs->Width = 640; gs->Height = 480; break;
+    case 4: gs->Mode = GS_MODE_DTV_720P; gs->Interlace = GS_NONINTERLACED;      /* 640x360, растягивается вдвое */
+            gs->Field = GS_FRAME; gs->Width = 640; gs->Height = 360; break;
+    case 5: gs->Mode = GS_MODE_DTV_1080I; gs->Interlace = GS_INTERLACED;         /* 640x540, растягивается в 3x2 */
+            gs->Field = GS_FIELD; gs->Width = 640; gs->Height = 540; gs->PSM = GS_PSM_CT16; break;
     default: break;
     }
-    gs->PSM = GS_PSM_CT24;
     gs->ZBuffering = GS_SETTING_OFF;
     gs->PrimAlphaEnable = GS_SETTING_ON;
     gs->DoubleBuffering = GS_SETTING_ON;
@@ -317,9 +521,14 @@ static void gfx_init(void) {
     gsKit_set_test(gs, GS_ZTEST_OFF);
     gsKit_set_primalpha(gs, GS_SETREG_ALPHA(0, 1, 0, 1, 0), 0);
 
+    VW = (cfg.wide || run_video >= 4) ? 854.0f : 640.0f;
+    kx = gs->Width / VW;
+    ky = gs->Height / VH;
+    dt = (gs->Mode == GS_MODE_PAL) ? 1.0f / 50.0f : 1.0f / 60.0f;
+
     char p[160];
-    img_path(p, sizeof p, "font.png");
-    font_ok = (load_png(&font_tex, p) == 0);
+    img_path(p, sizeof p, "font_src.png");
+    font_ok = font_build_all(p);
     if (!font_ok) {                            /* запасной встроенный шрифт (только латиница) */
         fontm = gsKit_init_fontm();
         gsKit_fontm_upload(gs, fontm);
@@ -327,25 +536,21 @@ static void gfx_init(void) {
         cfg.lang = 0;
     }
     img_path(p, sizeof p, "logo.png");
-    logo_ok = (load_png(&logo_tex, p) == 0);
+    logo_ok = (load_png_ex(&logo_tex, p, 320, 144, 0) == 0);
     gsKit_TexManager_init(gs);
-
-    VW = cfg.wide ? 854.0f : 640.0f;
-    kx = gs->Width / VW;
-    ky = gs->Height / VH;
-    dt = (gs->Mode == GS_MODE_PAL) ? 1.0f / 50.0f : 1.0f / 60.0f;
 }
 
-/* ---------- Текст из атласа ---------- */
-static const FontGlyph *find_glyph(unsigned cp) {
+/* ---------- Текст ---------- */
+static int glyph_idx(unsigned cp) {
     int lo = 0, hi = (int)FONT_NGLYPH - 1;
     while (lo <= hi) {
         int mid = (lo + hi) / 2;
-        if (font_glyphs[mid].cp == cp) return &font_glyphs[mid];
+        if (font_glyphs[mid].cp == cp) return mid;
         if (font_glyphs[mid].cp < cp) lo = mid + 1; else hi = mid - 1;
     }
-    return NULL;
+    return -1;
 }
+static int glyph_of(unsigned cp) { int i = glyph_idx(cp); return i >= 0 ? i : glyph_idx('?'); }
 static unsigned utf8_next(const unsigned char **ps) {
     const unsigned char *s = *ps;
     unsigned c = *s++, cp;
@@ -364,16 +569,16 @@ static unsigned utf8_next(const unsigned char **ps) {
 }
 static float text_w(float h, const char *s) {
     if (!font_ok) return (float)strlen(s) * h * 0.5f;
-    float sc = h / FONT_EM, w = 0;
+    float k = h / FONT_SRC_EM / 16.0f, w = 0;
     const unsigned char *p = (const unsigned char *)s;
     while (*p) {
-        const FontGlyph *g = find_glyph(utf8_next(&p));
-        if (!g) g = find_glyph('?');
-        if (g) w += g->adv16 * sc / 16.0f;
+        int i = glyph_of(utf8_next(&p));
+        if (i >= 0) w += font_glyphs[i].adv16 * k;
     }
     return w;
 }
-/* h = размер шрифта в виртуальных пикселях, (x, y) = левый верх строки; возвращает ширину */
+/* h = размер шрифта в виртуальных пикселях (17 и 22 рисуются без масштабирования),
+   (x, y) = левый верх строки; возвращает ширину */
 static float text(float x, float y, float h, u64 col, const char *s) {
     if (!font_ok) {
         char buf[96];
@@ -383,21 +588,23 @@ static float text(float x, float y, float h, u64 col, const char *s) {
         gsKit_fontm_print_scaled(gs, fontm, X(x), Y(y), 3, h / 48.0f * ky, col, buf);
         return text_w(h, buf);
     }
-    float sc = h / FONT_EM, pen = x;
+    FontCls *fc = (h < 19.5f) ? &fcls[0] : &fcls[1];
+    float sc = h / fc->h, k = h / FONT_SRC_EM / 16.0f, pen = x;
+    float oy = floorf(Y(y) + 0.5f);
     const unsigned char *p = (const unsigned char *)s;
-    gsKit_TexManager_bind(gs, &font_tex);
+    gsKit_TexManager_bind(gs, &fc->tex);
     while (*p) {
-        const FontGlyph *g = find_glyph(utf8_next(&p));
-        if (!g) g = find_glyph('?');
-        if (!g) continue;
-        if (g->w) {
-            float gx = pen + g->xo * sc, gy = y + g->yo * sc;
-            gsKit_prim_sprite_texture(gs, &font_tex,
-                                      X(gx), Y(gy), g->x, g->y,
-                                      X(gx + g->w * sc), Y(gy + g->h * sc), g->x + g->w, g->y + g->h,
+        int i = glyph_of(utf8_next(&p));
+        if (i < 0) continue;
+        const BGlyph *b = &fc->g[i];
+        if (b->w) {
+            float gx = floorf(X(pen) + 0.5f) + b->ox * sc, gy = oy + b->oy * sc;
+            gsKit_prim_sprite_texture(gs, &fc->tex,
+                                      gx, gy, b->x, b->y,
+                                      gx + b->w * sc, gy + b->h * sc, b->x + b->w, b->y + b->h,
                                       3, col);
         }
-        pen += g->adv16 * sc / 16.0f;
+        pen += font_glyphs[i].adv16 * k;
     }
     return pen - x;
 }
@@ -565,10 +772,8 @@ static int load_art(Game *g) {
     if (!g->id[0]) return -1;
     for (int k = 0; k < 3; k++) {
         snprintf(p, sizeof p, ROOT "ART/%s_%s.png", g->id, suf[k]);
-        if (load_png(&g->icon, p) == 0) {
-            float w = g->icon.Width, h = g->icon.Height;
-            if (h > w) { float o = (h - w) * 0.5f; g->u0 = 0; g->u1 = w; g->v0 = o; g->v1 = o + w; }
-            else       { float o = (w - h) * 0.5f; g->u0 = o; g->u1 = o + h; g->v0 = 0; g->v1 = h; }
+        if (load_png_ex(&g->icon, p, 72, 72, 1) == 0) {
+            g->u0 = 0; g->v0 = 0; g->u1 = (float)g->icon.Width; g->v1 = (float)g->icon.Height;
             return 0;
         }
     }
@@ -627,7 +832,8 @@ enum {
     L_LANGUAGE, L_TZ, L_CLOCKFMT, L_VIDEO, L_ASPECT, L_BACK, L_VOLUME, L_MUSIC, L_EFFECTS, L_TRACK,
     L_ON, L_OFF, L_UNSAVED, L_SAVED, L_SAVEFAIL, L_NOGAMES, L_SRCSOON, L_LAUNCHSOON, L_SOON_PAGE,
     L_ASK_EXIT, L_ASK_POWER, L_YES, L_NO, L_NEEDRESTART, L_NOFONT, L_NOTRACKS, L_NOPOWEROFF,
-    L_RESTARTFAIL, L_SOUNDSOON, L_HINT_GAMES, L_HINT_MENU, L_HINT_CONFIRM, L_PLAY, L_COUNT
+    L_RESTARTFAIL, L_SOUNDSOON, L_HINT_GAMES, L_HINT_MENU, L_HINT_CONFIRM, L_PLAY,
+    L_KEEPVIDEO, L_REVERTIN, L_COUNT
 };
 static const char *const tr_tab[L_COUNT][2] = {
     [L_GAMES]       = { "Games", "Игры" },
@@ -664,7 +870,7 @@ static const char *const tr_tab[L_COUNT][2] = {
     [L_YES]         = { "Yes", "Да" },
     [L_NO]          = { "No", "Нет" },
     [L_NEEDRESTART] = { "Applies after restart", "Применится после перезапуска" },
-    [L_NOFONT]      = { "img/font.png not found: English only", "Нет img/font.png: только английский" },
+    [L_NOFONT]      = { "img/font_src.png not found: English only", "Нет img/font_src.png: только английский" },
     [L_NOTRACKS]    = { "No tracks in sound/music", "Нет треков в sound/music" },
     [L_NOPOWEROFF]  = { "Power off is not available in this build", "В этой сборке выключение недоступно" },
     [L_RESTARTFAIL] = { "Could not start the launcher ELF", "Не удалось запустить ELF лаунчера" },
@@ -674,6 +880,8 @@ static const char *const tr_tab[L_COUNT][2] = {
                         "\xE2\x96\xB2\xE2\x96\xBC Выбор     \xE2\x97\x84\xE2\x96\xBA Изменить     \xE2\x9C\x95 OK     \xE2\x97\x8B Назад" },
     [L_HINT_CONFIRM]= { "\xE2\x9C\x95 Yes     \xE2\x97\x8B No", "\xE2\x9C\x95 Да     \xE2\x97\x8B Нет" },
     [L_PLAY]        = { "PS2", "PS2" },
+    [L_KEEPVIDEO]   = { "Keep this video mode?", "Оставить этот видеорежим?" },
+    [L_REVERTIN]    = { "Reverting in %d s if no answer", "Автоотмена через %d с, если не ответить" },
 };
 #define T(id) (tr_tab[(id)][cfg.lang ? 1 : 0])
 
@@ -740,7 +948,7 @@ static const char *item_label(int p, int i) {
 }
 /* значение справа; пустая строка = у пункта нет значения */
 static void item_value(int p, int i, char *out, size_t n) {
-    static const char *vid[] = { "Auto", "NTSC", "PAL", "480p" };
+    static const char *vid[NVIDEO] = { "Auto", "NTSC", "PAL", "480p", "720p", "1080i" };
     out[0] = 0;
     if (p == PG_SCREEN) {
         char tz[24];
@@ -748,7 +956,7 @@ static void item_value(int p, int i, char *out, size_t n) {
         case 0: snprintf(out, n, "\xE2\x97\x84 %s \xE2\x96\xBA", cfg.lang ? "Русский" : "English"); break;
         case 1: tz_str(tz, sizeof tz); snprintf(out, n, "\xE2\x97\x84 %s \xE2\x96\xBA", tz); break;
         case 2: snprintf(out, n, "\xE2\x97\x84 %s \xE2\x96\xBA", cfg.clock24 ? "24" : "12 AM/PM"); break;
-        case 3: snprintf(out, n, "\xE2\x97\x84 %s \xE2\x96\xBA", vid[cfg.video & 3]); break;
+        case 3: snprintf(out, n, "\xE2\x97\x84 %s \xE2\x96\xBA", vid[(cfg.vtry >= 0 ? cfg.vtry : cfg.video) % NVIDEO]); break;
         case 4: snprintf(out, n, "\xE2\x97\x84 %s \xE2\x96\xBA", cfg.wide ? "16:9" : "4:3"); break;
         }
     } else if (p == PG_SOUND) {
@@ -772,7 +980,12 @@ static void item_adjust(int p, int i, int dir) {
             break;
         case 1: cfg.tz = (int)clampf((float)(cfg.tz + dir * 30), -720, 840); break;
         case 2: cfg.clock24 ^= 1; break;
-        case 3: cfg.video = (cfg.video + dir + 4) & 3; toast(T(L_NEEDRESTART)); break;
+        case 3: {
+            int cv = (cfg.vtry >= 0 ? cfg.vtry : cfg.video), nv2 = (cv + dir + NVIDEO) % NVIDEO;
+            cfg.vtry = (nv2 == cfg.video) ? -1 : nv2;
+            toast(T(L_NEEDRESTART));
+            break;
+        }
         case 4: cfg.wide ^= 1; toast(T(L_NEEDRESTART)); break;
         default: changed = 0;
         }
@@ -820,8 +1033,8 @@ static void draw_settings(float a) {
     float rowh = 42, pw = 520, px = (VW - pw) * 0.5f, py = 50;
     float ph = 74 + n * rowh + 14, slide = (1.0f - a) * 26;
     rr_fill(px, py + slide, pw, ph, 16, RGBA(0x12, 0x16, 0x24, 1.0f * a));
-    text(px + 30, py + slide + 20, 26, TXT(255, 255, 255, a), page_title(pg));
-    fill_rect(px + 28, py + slide + 62, pw - 56, 1, RGBA(255, 255, 255, 0.18f * a));
+    text(px + 30, py + slide + 22, 22, TXT(255, 255, 255, a), page_title(pg));
+    fill_rect(px + 28, py + slide + 62, pw - 56, 2, RGBA(255, 255, 255, 0.18f * a));
     for (int i = 0; i < n; i++) {
         float y = py + slide + 74 + i * rowh;
         char val[64];
@@ -834,14 +1047,30 @@ static void draw_settings(float a) {
         text(px + 34, y + 8, 22, TXT(255, 255, 255, ta * a), item_label(pg, i));
         if (val[0]) text_r(px + pw - 34, y + 8, 22, TXT(255, 255, 255, ta * a), val);
     }
-    text_c(VW * 0.5f, VH - 36, 17, TXT(255, 255, 255, 0.7f * a), T(L_HINT_MENU));
+    text_c(VW * 0.5f, VH - 36, 17, TXT(255, 255, 255, 0.75f * a), T(L_HINT_MENU));
+}
+static void trial_keep(void) {
+    cfg.video = run_video; cfg.vtry = -1; trial_on = 0; confirm = 0;
+    toast(save_cfg() == 0 ? T(L_SAVED) : T(L_SAVEFAIL));
+}
+static void trial_revert(void) {
+    cfg.vtry = -1; trial_on = 0; confirm = 0;
+    do_restart();                                   /* сохранит прежний режим и перезапустит */
 }
 static void draw_confirm(void) {
     gsKit_prim_sprite(gs, 0, 0, gs->Width, gs->Height, 5, RGBA(0, 0, 0, 0.55f));
     float w = 420, h = 130, x = (VW - w) * 0.5f, y = 170;
     rr_fill(x, y, w, h, 16, RGBA(0x16, 0x1A, 0x2A, 0.98f));
-    text_c(VW * 0.5f, y + 28, 24, TXT(255, 255, 255, 1), confirm == 1 ? T(L_ASK_EXIT) : T(L_ASK_POWER));
-    text_c(VW * 0.5f, y + 82, 20, TXT(255, 255, 255, 0.75f), T(L_HINT_CONFIRM));
+    if (confirm == 3) {
+        char l2[96];
+        snprintf(l2, sizeof l2, T(L_REVERTIN), (int)ceilf(trial_left));
+        text_c(VW * 0.5f, y + 20, 22, TXT(255, 255, 255, 1), T(L_KEEPVIDEO));
+        text_c(VW * 0.5f, y + 58, 17, TXT(255, 255, 255, 0.8f), l2);
+        text_c(VW * 0.5f, y + 92, 17, TXT(255, 255, 255, 0.75f), T(L_HINT_CONFIRM));
+        return;
+    }
+    text_c(VW * 0.5f, y + 28, 22, TXT(255, 255, 255, 1), confirm == 1 ? T(L_ASK_EXIT) : T(L_ASK_POWER));
+    text_c(VW * 0.5f, y + 82, 17, TXT(255, 255, 255, 0.75f), T(L_HINT_CONFIRM));
 }
 
 /* ---------- Заставка ---------- */
@@ -851,7 +1080,7 @@ static Particle part[NPART];
 static float intro_t;
 static int   intro_on = 1, parts_made;
 
-static float t_part(void) { return logo_ok ? 2.2f : 0.5f; }
+static float t_part(void) { return logo_ok ? 3.0f : 0.4f; }   /* логотип 3 с, затем 2 с частиц */
 
 static void parts_spawn(void) {
     for (int i = 0; i < NPART; i++) {
@@ -862,8 +1091,8 @@ static void parts_spawn(void) {
         p->y = VH * 0.5f + sinf(a) * 8.0f;
         p->vx = cosf(a) * sp;
         p->vy = sinf(a) * sp * 0.7f;
-        p->age = -(float)(rand() % 500) / 1000.0f;       /* разный момент появления */
-        p->life = 1.3f + (float)(rand() % 1000) / 1000.0f;
+        p->age = -(float)(rand() % 400) / 1000.0f;       /* разный момент появления */
+        p->life = 0.9f + (float)(rand() % 700) / 1000.0f;
         p->size = 1.5f + (float)(rand() % 30) / 10.0f;
         p->blue = (rand() % 100) < 40;
     }
@@ -882,18 +1111,18 @@ static void intro_update(void) {
             p->vx += -vy * k;  p->vy += vx * k;
             p->x += p->vx * dt;  p->y += p->vy * dt;
         }
-    if (intro_t >= t_part() + 2.6f) intro_on = 0;
+    if (intro_t >= t_part() + 2.0f) intro_on = 0;
 }
 static float intro_cover(void) {        /* непрозрачность чёрного поверх меню */
-    float t0 = t_part() + 0.3f;
-    return 1.0f - smooth01((intro_t - t0) / 1.3f);
+    float t0 = t_part() + 0.1f;
+    return 1.0f - smooth01((intro_t - t0) / 1.5f);
 }
 static void draw_intro(void) {
     float cover = intro_cover();
     if (cover > 0) gsKit_prim_sprite(gs, 0, 0, gs->Width, gs->Height, 6, RGBA(0, 0, 0, cover));
     if (logo_ok) {
-        float a = smooth01((intro_t - 0.4f) / 0.7f) * (1.0f - smooth01((intro_t - 2.0f) / 0.5f));
-        float w = 220, h = w * logo_tex.Height / (float)logo_tex.Width;
+        float a = smooth01((intro_t - 0.4f) / 0.8f) * (1.0f - smooth01((intro_t - 2.4f) / 0.6f));
+        float w = 260, h = w * logo_tex.Height / (float)logo_tex.Width;
         draw_tex_box(&logo_tex, (VW - w) * 0.5f, (VH - h) * 0.5f, w, h, a);
     }
     if (!parts_made) return;
@@ -919,8 +1148,14 @@ int main(int argc, char *argv[]) {
     set_self(argc, argv);
     find_app_dir();
     load_cfg();
-    if (select_held()) cfg.video = 0;
+    run_video = cfg.video;
+    if (select_held()) { cfg.video = 0; cfg.vtry = -1; run_video = 0; }
+    else if (cfg.vtry >= 0) {            /* проба режима: прежний режим записываем заранее, на случай зависания */
+        run_video = cfg.vtry; trial_on = 1; trial_left = 10.0f; cfg.vtry = -1;
+        save_cfg();
+    }
     gfx_init();
+    if (trial_on) { intro_on = 0; confirm = 3; }
     rr_init();
     clock_init();
     srand(12345);
@@ -929,17 +1164,17 @@ int main(int argc, char *argv[]) {
     scan_dir("CD", 1);
     qsort(games, ngames, sizeof(Game), cmp_game);
 
-    int sel = 0, idle = 0, bgFront = 0, bgFor = -1, lgoFor = -1, lap = 0;
+    int sel = 0, idle = 0, bgFor = -1, lgoFor = -1, lap = 0;
     int tab = 0, src = 0, hold[4] = { 0, 0, 0, 0 }, pad_on[4] = { 0, 0, 0, 0 };
     u32 prev = 0xFFFF;
     unsigned frame = 0;
-    GSTEXTURE bg[2];
-    memset(bg, 0, sizeof bg);
-    Anim cam, titleA, titleY, bgFade, tabPos, tabFade, srcA[5];
+    GSTEXTURE bg;
+    memset(&bg, 0, sizeof bg);
+    Anim cam, titleA, titleY, bgA, tabPos, tabFade, srcA[5];
     anim_init(&cam, 0, 14);
     anim_init(&titleA, 1, 10);
     anim_init(&titleY, 0, 10);
-    anim_init(&bgFade, 1, 6);
+    anim_init(&bgA, 0, 9);
     anim_init(&tabPos, 0, 14);
     anim_init(&tabFade, 1, 12);
     for (int i = 0; i < 5; i++) anim_init(&srcA[i], i == 0 ? 1 : 0, 14);
@@ -958,6 +1193,9 @@ int main(int argc, char *argv[]) {
 
         if (intro_on) {
             if (pressed & (PAD_CROSS | PAD_START)) intro_t = t_part() + 3.0f;
+        } else if (confirm == 3) {
+            if (pressed & PAD_CROSS) trial_keep();
+            if (pressed & PAD_CIRCLE) trial_revert();
         } else if (confirm) {
             if (pressed & PAD_CROSS) { int c = confirm; confirm = 0; if (c == 1) do_exit(); else do_poweroff(); }
             if (pressed & PAD_CIRCLE) confirm = 0;
@@ -987,11 +1225,13 @@ int main(int argc, char *argv[]) {
                     titleA.v = 0; anim_to(&titleA, 1);
                     titleY.v = 8; anim_to(&titleY, 0);
                     lgo_state = 0;
+                    anim_to(&bgA, 0);
                 }
                 int ds = fD ? 1 : fU ? -1 : 0;
                 if (ds) {
                     src = (src + ds + 5) % 5;
                     sel = 0; lap = 0; idle = 0; cam.v = cam.t = 0;
+                    lgo_state = 0; anim_to(&bgA, 0);
                 }
                 if ((pressed & PAD_CROSS) && nvis > 0) toast(T(L_LAUNCHSOON));
             }
@@ -1004,6 +1244,7 @@ int main(int argc, char *argv[]) {
         if (set_open) set_anim = clampf(set_anim + dt / 0.55f, 0, 1);
         else          set_anim = clampf(set_anim - dt / 0.30f, 0, 1);
         if (toast_t > 0) toast_t -= dt;
+        if (trial_on) { trial_left -= dt; if (trial_left <= 0) trial_revert(); }
         if (frame % 30 == 0) clock_update();
         if (frame % 20 == 0) { pad_on[0] = pad_connected(0); pad_on[1] = pad_connected(1); }
 
@@ -1029,26 +1270,28 @@ int main(int argc, char *argv[]) {
         if (!looping) lap = 0;
         anim_step(&titleA, dt);
         anim_step(&titleY, dt);
-        anim_step(&bgFade, dt);
+        anim_step(&bgA, dt);
 
         /* --- подгрузка --- */
-        if (nvis2 && idle == 12 && bgFor != sel) {
-            int back = bgFront ^ 1;
-            free_tex(&bg[back]);
-            if (games[sel].id[0]) {
-                char p[96];
-                snprintf(p, sizeof p, ROOT "ART/%s_BG.png", games[sel].id);
-                load_png(&bg[back], p);
+        if (!nvis2) anim_to(&bgA, 0);
+        if (nvis2 && idle == 12) {
+            if (bgFor != sel) {
+                free_tex(&bg);
+                if (games[sel].id[0]) {
+                    char p[96];
+                    snprintf(p, sizeof p, ROOT "ART/%s_BG.png", games[sel].id);
+                    load_png_ex(&bg, p, 448, 252, 0);
+                }
+                bgFor = sel;
             }
-            bgFront = back; bgFor = sel;
-            bgFade.v = 0; anim_to(&bgFade, 1);
+            anim_to(&bgA, 1);
         } else if (nvis2 && idle == 14 && lgoFor != sel) {
             free_tex(&lgo_tex);
             lgo_state = 0;
             if (games[sel].id[0]) {
                 char p[96];
                 snprintf(p, sizeof p, ROOT "ART/%s_LGO.png", games[sel].id);
-                if (load_png(&lgo_tex, p) == 0) lgo_state = 1;
+                if (load_png_ex(&lgo_tex, p, 256, 128, 0) == 0) lgo_state = 1;
             }
             lgoFor = sel;
         } else if (nvis2 && idle > 2) {
@@ -1058,8 +1301,7 @@ int main(int argc, char *argv[]) {
         /* --- отрисовка --- */
         float W = gs->Width, H = gs->Height;
         gsKit_clear(gs, RGBA(0x08, 0x0C, 0x18, 1));
-        draw_full(&bg[bgFront ^ 1], 1.0f - bgFade.v);
-        draw_full(&bg[bgFront], bgFade.v);
+        draw_full(&bg, bgA.v);
 
         u64 dark = RGBA(0, 0, 0, 0.7f), none = RGBA(0, 0, 0, 0);
         gsKit_prim_quad_gouraud(gs, 0, 0, 0, H, X(VW * 0.6f), 0, X(VW * 0.6f), H, 1,
@@ -1072,7 +1314,7 @@ int main(int argc, char *argv[]) {
         /* вкладки по центру */
         {
             const char *names[3] = { T(L_GAMES), T(L_APPS), T(L_FILES) };
-            float wd[3], cxs[3], total_w = 0, spacing = 56;
+            float wd[3], cxs[3], total_w = 0, spacing = VW > 700 ? 56 : 30;
             for (int i = 0; i < 3; i++) { wd[i] = text_w(22, names[i]); total_w += wd[i]; }
             total_w += spacing * 2;
             float px = (VW - total_w) * 0.5f;
@@ -1131,22 +1373,22 @@ int main(int argc, char *argv[]) {
                 Game *g = &games[sel];
                 float sx = ANCHOR_X + tile_x[sel] - cam.v + lerpf(TILE_S, TILE_L, g->scale.v);
                 char nm[96];
-                fit_text(nm, sizeof nm, g->name, 18, 330);
-                text(sx + 12, ROW_Y + TILE_S + 10 + titleY.v, 18, TXT(255, 255, 255, titleA.v), nm);
+                fit_text(nm, sizeof nm, g->name, 17, 330);
+                text(sx + 12, ROW_Y + TILE_S + 10 + titleY.v, 17, TXT(255, 255, 255, titleA.v), nm);
 
-                if (lgo_state == 1 && lgoFor == sel) {                  /* логотип игры вместо названия */
-                    float bw = 320, bh = 130;
+                if (lgo_state == 1 && lgoFor == sel) {                  /* логотип игры: внизу слева */
+                    float bw = 330, bh = 140;
                     float sc = fminf(bw / lgo_tex.Width, bh / lgo_tex.Height);
                     float w = lgo_tex.Width * sc, h = lgo_tex.Height * sc;
-                    draw_tex_box(&lgo_tex, 56, 300 - h + titleY.v, w, h, titleA.v);
+                    draw_tex_box(&lgo_tex, 56, 388 - h + titleY.v, w, h, titleA.v);
                 } else {
                     char big[96];
-                    fit_text(big, sizeof big, g->name, 38, 520);
-                    text(56, 262 + titleY.v, 38, TXT(255, 255, 255, titleA.v), big);
+                    fit_text(big, sizeof big, g->name, 22, 520);
+                    text(56, 350 + titleY.v, 22, TXT(255, 255, 255, titleA.v), big);
                 }
                 char sub[48];
                 snprintf(sub, sizeof sub, "%s \xC2\xB7 %s", T(L_PLAY), g->is_cd ? "CD" : "DVD");
-                text(58, 312 + titleY.v, 18, TXT(200, 200, 200, titleA.v * 0.8f), sub);
+                text(58, 394 + titleY.v, 17, TXT(200, 200, 200, titleA.v * 0.8f), sub);
             } else {
                 text_c(VW * 0.5f, 250, 22, TXT(255, 255, 255, 0.85f), src == 0 ? T(L_NOGAMES) : T(L_SRCSOON));
             }
@@ -1155,14 +1397,14 @@ int main(int argc, char *argv[]) {
             for (int i = 0; i < 5; i++) {
                 float a = srcA[i].v;
                 float y = 214 + i * 32;
-                float sz = lerpf(19, 24, a);
+                float sz = a > 0.5f ? 22.0f : 17.0f;
                 if (a > 0.02f) rr_fill(VW - MARGIN - 150, y + 1, 150 + 10, 36, 12, RGBA(255, 255, 255, 0.14f * a));
                 text_r(VW - MARGIN, y, sz, TXT(255, 255, 255, 0.5f + 0.5f * a), SRC_NAME[i]);
             }
         } else {
             float a = tabFade.v;
-            text_c(VW * 0.5f, 210, 30, TXT(255, 255, 255, a), tab == 1 ? T(L_APPS) : T(L_FILES));
-            text_c(VW * 0.5f, 256, 19, TXT(200, 200, 200, 0.85f * a), T(L_SOON_PAGE));
+            text_c(VW * 0.5f, 210, 22, TXT(255, 255, 255, a), tab == 1 ? T(L_APPS) : T(L_FILES));
+            text_c(VW * 0.5f, 250, 17, TXT(200, 200, 200, 0.85f * a), T(L_SOON_PAGE));
         }
 
         if (!intro_on || intro_t < t_part() + 3.0f)
@@ -1172,9 +1414,9 @@ int main(int argc, char *argv[]) {
         if (confirm) draw_confirm();
         if (toast_t > 0) {
             float a = clampf(toast_t / 0.4f, 0, 1);
-            float w = text_w(19, toast_msg) + 44;
+            float w = text_w(17, toast_msg) + 44;
             rr_fill((VW - w) * 0.5f, VH - 82, w, 34, 17, RGBA(0x10, 0x14, 0x22, 0.94f * a));
-            text_c(VW * 0.5f, VH - 77, 19, TXT(255, 255, 255, a), toast_msg);
+            text_c(VW * 0.5f, VH - 75, 17, TXT(255, 255, 255, a), toast_msg);
         }
         if (intro_on) draw_intro();
 
