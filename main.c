@@ -32,11 +32,17 @@
 #ifndef HAVE_POWEROFF
 #define HAVE_POWEROFF 1
 #endif
+#ifndef HAVE_AUDIO
+#define HAVE_AUDIO 1
+#endif
 #if HAVE_CDVD
 #include <libcdvd.h>
 #endif
 #if HAVE_POWEROFF
 #include <libpwroff.h>
+#endif
+#if HAVE_AUDIO
+#include <audsrv.h>
 #endif
 
 #include "anim.h"
@@ -62,6 +68,9 @@ IRX(iomanX_irx) IRX(fileXio_irx) IRX(usbd_irx)
 IRX(bdm_irx) IRX(bdmfs_fatfs_irx) IRX(usbmass_bd_irx)
 #if HAVE_POWEROFF
 IRX(poweroff_irx)
+#endif
+#if HAVE_AUDIO
+IRX(audsrv_irx)
 #endif
 
 typedef struct {
@@ -132,6 +141,10 @@ static void iop_init(void) {
 #endif
     SifLoadModule("rom0:SIO2MAN", 0, NULL);
     SifLoadModule("rom0:PADMAN",  0, NULL);
+#if HAVE_AUDIO
+    SifLoadModule("rom0:LIBSD", 0, NULL);
+    SifExecModuleBuffer(audsrv_irx, size_audsrv_irx, 0, NULL, NULL);
+#endif
     SifExecModuleBuffer(usbd_irx,        size_usbd_irx,        0, NULL, NULL);
     SifExecModuleBuffer(bdm_irx,         size_bdm_irx,         0, NULL, NULL);
     SifExecModuleBuffer(bdmfs_fatfs_irx, size_bdmfs_fatfs_irx, 0, NULL, NULL);
@@ -288,6 +301,263 @@ static int save_cfg(void) {
     return bad ? -1 : 0;
 }
 
+/* ---------- Звук (audsrv): музыка из sound/music, эффекты из sound/fx, только WAV 8/16 бит ---------- */
+#define OUT_RATE 44100
+enum { FX_MOVE, FX_SELECT, FX_BACK, FX_TAB, FX_OPEN, FX_INTRO, FX_COUNT };
+static const char *const FX_FILE[FX_COUNT] = { "move.wav", "select.wav", "back.wav", "tab.wav", "open.wav", "intro.wav" };
+
+static char tracks[MAX_TRACKS][48];
+static int  ntracks;
+static int  audio_ok;
+
+static int cmp_track(const void *a, const void *b) { return strcasecmp((const char *)a, (const char *)b); }
+static void scan_tracks(void) {
+    char path[160];
+    ntracks = 0;
+    snprintf(path, sizeof path, "%s/sound/music", app_dir);
+    DIR *d = opendir(path);
+    if (!d) return;
+    struct dirent *e;
+    while ((e = readdir(d)) && ntracks < MAX_TRACKS) {
+        size_t L = strlen(e->d_name);
+        if (L < 5 || L > 47 || strcasecmp(e->d_name + L - 4, ".wav")) continue;
+        snprintf(tracks[ntracks++], sizeof tracks[0], "%.47s", e->d_name);
+    }
+    closedir(d);
+    qsort(tracks, ntracks, sizeof tracks[0], cmp_track);
+}
+
+typedef struct {
+    FILE *f;
+    long data_off;
+    unsigned data_len, data_pos;
+    int ch, bits, rate;
+    unsigned char raw[4096];
+    int raw_len, raw_pos, eof;
+    int s0[2], s1[2];
+    unsigned frac, step;                 /* 16.16: позиция между s0 и s1, шаг = rate / OUT_RATE */
+    int loop, primed;
+} Src;
+
+static unsigned rd32(const unsigned char *p) { return p[0] | (p[1] << 8) | (p[2] << 16) | ((unsigned)p[3] << 24); }
+static unsigned rd16(const unsigned char *p) { return p[0] | (p[1] << 8); }
+static short clip16(int v) { return (short)(v > 32767 ? 32767 : (v < -32768 ? -32768 : v)); }
+
+static int src_open(Src *s, const char *path, int loop) {
+    unsigned char h[12], c[8], fmt[16];
+    int have_fmt = 0;
+    long fsize;
+    memset(s, 0, sizeof *s);
+    s->f = fopen(path, "rb");
+    if (!s->f) return -1;
+    if (fread(h, 1, 12, s->f) != 12 || memcmp(h, "RIFF", 4) || memcmp(h + 8, "WAVE", 4)) goto bad;
+    for (;;) {
+        if (fread(c, 1, 8, s->f) != 8) goto bad;
+        unsigned len = rd32(c + 4);
+        if (!memcmp(c, "fmt ", 4) && len >= 16) {
+            unsigned tag;
+            if (fread(fmt, 1, 16, s->f) != 16) goto bad;
+            tag = rd16(fmt);
+            s->ch = (int)rd16(fmt + 2); s->rate = (int)rd32(fmt + 4); s->bits = (int)rd16(fmt + 14);
+            if ((tag != 1 && tag != 0xFFFE) || s->ch < 1 || s->ch > 2 || (s->bits != 16 && s->bits != 8) ||
+                s->rate < 4000 || s->rate > 96000) goto bad;
+            if (len > 16) fseek(s->f, (long)(len - 16 + (len & 1)), SEEK_CUR);
+            have_fmt = 1;
+        } else if (!memcmp(c, "data", 4)) {
+            if (!have_fmt) goto bad;
+            s->data_off = ftell(s->f);
+            s->data_len = len;
+            break;
+        } else {
+            fseek(s->f, (long)(len + (len & 1)), SEEK_CUR);
+        }
+    }
+    fseek(s->f, 0, SEEK_END);
+    fsize = ftell(s->f);
+    if (fsize < s->data_off) goto bad;
+    if ((long)s->data_len > fsize - s->data_off || s->data_len == 0) s->data_len = (unsigned)(fsize - s->data_off);
+    if (s->data_len < (unsigned)(s->ch * s->bits / 8) * 2) goto bad;
+    fseek(s->f, s->data_off, SEEK_SET);
+    s->loop = loop;
+    s->step = (unsigned)(((unsigned long long)s->rate << 16) / OUT_RATE);
+    return 0;
+bad:
+    fclose(s->f);
+    s->f = NULL;
+    return -1;
+}
+/* следующий исходный кадр (с зацикливанием при loop); 0 = конец */
+static int src_raw(Src *s, int out[2]) {
+    int fb = s->ch * (s->bits / 8);
+    if (s->raw_pos + fb > s->raw_len) {
+        unsigned chunk = (unsigned)(sizeof s->raw - (sizeof s->raw % (unsigned)fb));
+        unsigned want = chunk, left = s->data_len - s->data_pos;
+        int got = 0;
+        if (want > left) want = left;
+        if (want >= (unsigned)fb) got = (int)fread(s->raw, 1, want, s->f);
+        got -= got % fb;
+        if (got < fb) {
+            if (!s->loop) return 0;
+            fseek(s->f, s->data_off, SEEK_SET);
+            s->data_pos = 0;
+            want = chunk < s->data_len ? chunk : s->data_len;
+            got = (int)fread(s->raw, 1, want, s->f);
+            got -= got % fb;
+            if (got < fb) return 0;
+        }
+        s->raw_len = got; s->raw_pos = 0; s->data_pos += (unsigned)got;
+    }
+    {
+        const unsigned char *p = s->raw + s->raw_pos;
+        if (s->bits == 16) {
+            out[0] = (short)rd16(p);
+            out[1] = s->ch == 2 ? (short)rd16(p + 2) : out[0];
+        } else {
+            out[0] = ((int)p[0] - 128) * 256;
+            out[1] = s->ch == 2 ? ((int)p[1] - 128) * 256 : out[0];
+        }
+    }
+    s->raw_pos += fb;
+    return 1;
+}
+/* кадр на частоте OUT_RATE (линейная интерполяция); 0 = конец звука */
+static int src_next(Src *s, int out[2]) {
+    if (!s->primed) {
+        s->primed = 1;
+        s->frac = 0;
+        if (!src_raw(s, s->s0)) return 0;
+        if (!src_raw(s, s->s1)) { s->s1[0] = s->s0[0]; s->s1[1] = s->s0[1]; s->eof = 1; }
+    }
+    if (s->eof && s->frac >= 65536u) return 0;
+    out[0] = s->s0[0] + (int)(((long long)(s->s1[0] - s->s0[0]) * (long long)s->frac) >> 16);
+    out[1] = s->s0[1] + (int)(((long long)(s->s1[1] - s->s0[1]) * (long long)s->frac) >> 16);
+    s->frac += s->step;
+    while (s->frac >= 65536u && !s->eof) {
+        s->frac -= 65536u;
+        s->s0[0] = s->s1[0]; s->s0[1] = s->s1[1];
+        if (!src_raw(s, s->s1)) { s->eof = 1; s->s1[0] = s->s0[0]; s->s1[1] = s->s0[1]; }
+    }
+    return 1;
+}
+
+typedef struct { short *pcm; unsigned frames; } Fx;
+typedef struct { const short *p; unsigned pos, len; } Voice;
+#define NVOICE 4
+static Fx    fx[FX_COUNT];
+static Voice voice[NVOICE];
+static Src   mus;
+static int   mus_open, mus_want;
+static char  mus_name[64];
+static float mus_gain;
+
+static void audio_pump(void);
+static void music_stop(void) {
+    if (mus.f) fclose(mus.f);
+    memset(&mus, 0, sizeof mus);
+    mus_open = 0;
+    mus_name[0] = 0;
+}
+static void music_play(const char *name) {
+    char p[200];
+    music_stop();
+    if (!name || !name[0]) return;
+    snprintf(p, sizeof p, "%s/sound/music/%s", app_dir, name);
+    if (src_open(&mus, p, 1) == 0) {
+        mus_open = 1;
+        mus_gain = 0;
+        snprintf(mus_name, sizeof mus_name, "%s", name);
+    }
+}
+static void fx_load(int id) {
+    char p[200];
+    Src s;
+    int o[2];
+    unsigned n = 0, cap = OUT_RATE * 4;                 /* эффект не длиннее 4 секунд */
+    short *buf;
+    snprintf(p, sizeof p, "%s/sound/fx/%s", app_dir, FX_FILE[id]);
+    if (src_open(&s, p, 0) < 0) return;
+    buf = malloc((size_t)cap * 4);
+    if (buf)
+        while (n < cap && src_next(&s, o)) { buf[n * 2] = clip16(o[0]); buf[n * 2 + 1] = clip16(o[1]); n++; }
+    fclose(s.f);
+    if (buf && n) {
+        short *nb = realloc(buf, (size_t)n * 4);          /* освободить неиспользованный запас */
+        fx[id].pcm = nb ? nb : buf; fx[id].frames = n;
+    } else free(buf);
+}
+static void sfx(int id) {
+    int slot = -1, best = -1;
+    if (!audio_ok || !cfg.fx_on || id < 0 || id >= FX_COUNT || !fx[id].pcm) return;
+    for (int v = 0; v < NVOICE; v++) {
+        if (!voice[v].p) { slot = v; break; }
+        if ((int)voice[v].pos > best) { best = (int)voice[v].pos; slot = v; }
+    }
+    voice[slot].p = fx[id].pcm; voice[slot].pos = 0; voice[slot].len = fx[id].frames;
+}
+/* применить настройки музыки: включить, выключить или сменить трек */
+static void audio_apply(void) {
+    const char *want;
+    mus_want = cfg.music_on;
+    if (!audio_ok || !cfg.music_on) return;             /* выключенная музыка плавно затухнет в audio_pump */
+    want = cfg.track[0] ? cfg.track : (ntracks ? tracks[0] : "");
+    if (!want[0]) return;
+    if (!mus_open || strcmp(mus_name, want)) music_play(want);
+}
+/* докармливает звуковой буфер; вызывается каждый кадр и из долгих загрузок */
+static void audio_pump(void) {
+#if HAVE_AUDIO
+    static short buf[2048 * 2];
+    int avail, frames, fg;
+    float lv, mt;
+    if (!audio_ok) return;
+    avail = audsrv_available();
+    if (avail < 2048) return;
+    frames = avail / 4;
+    if (frames > 2048) frames = 2048;
+    lv = (float)cfg.volume / 100.0f; lv *= lv;
+    mt = (mus_want && mus_open) ? lv * 0.6f : 0.0f;
+    fg = (int)(lv * 256.0f);
+    for (int i = 0; i < frames; i++) {
+        int l = 0, r = 0, o[2], mg;
+        mus_gain += (mt - mus_gain) * 0.0001f;
+        mg = (int)(mus_gain * 256.0f);
+        if (mus_open) {
+            if (src_next(&mus, o)) { l += o[0] * mg >> 8; r += o[1] * mg >> 8; }
+            else music_stop();
+        }
+        for (int v = 0; v < NVOICE; v++)
+            if (voice[v].p) {
+                l += voice[v].p[voice[v].pos * 2] * fg >> 8;
+                r += voice[v].p[voice[v].pos * 2 + 1] * fg >> 8;
+                if (++voice[v].pos >= voice[v].len) voice[v].p = NULL;
+            }
+        buf[i * 2] = clip16(l); buf[i * 2 + 1] = clip16(r);
+    }
+    if (!mus_want && mus_open && mus_gain < 0.002f) music_stop();
+    audsrv_play_audio((const char *)buf, frames * 4);
+#endif
+}
+static void audio_init(void) {
+#if HAVE_AUDIO
+    struct audsrv_fmt_t fmt;
+    if (audsrv_init() != 0) return;
+    fmt.bits = 16; fmt.freq = OUT_RATE; fmt.channels = 2;
+    if (audsrv_set_format(&fmt) != 0) { audsrv_quit(); return; }
+    audsrv_set_volume(100);
+    audio_ok = 1;
+    for (int i = 0; i < FX_COUNT; i++) fx_load(i);
+#endif
+}
+static void audio_quit(void) {
+#if HAVE_AUDIO
+    if (!audio_ok) return;
+    music_stop();
+    audsrv_stop_audio();
+    audsrv_quit();
+    audio_ok = 0;
+#endif
+}
+
 /* ---------- Графика ---------- */
 static void free_tex(GSTEXTURE *t) {
     if (t->Mem) { gsKit_TexManager_free(gs, t); free(t->Mem); t->Mem = NULL; }
@@ -305,7 +575,7 @@ static unsigned char *png_decode(const char *path, int *ow, int *oh) {
     unsigned char *volatile pix = NULL;
     png_bytep *volatile rows = NULL;
     png_uint_32 w, h;
-    int depth, ctype;
+    int depth, ctype, passes;
     if (!fp) return NULL;
     if (fread(sig, 1, 8, fp) != 8 || png_sig_cmp(sig, 0, 8)) { fclose(fp); return NULL; }
     png = png_create_read_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
@@ -327,13 +597,17 @@ static unsigned char *png_decode(const char *path, int *ow, int *oh) {
     if (png_get_valid(png, info, PNG_INFO_tRNS)) png_set_tRNS_to_alpha(png);
     if (ctype == PNG_COLOR_TYPE_GRAY || ctype == PNG_COLOR_TYPE_GRAY_ALPHA) png_set_gray_to_rgb(png);
     png_set_filler(png, 0xFF, PNG_FILLER_AFTER);
-    png_set_interlace_handling(png);
+    passes = png_set_interlace_handling(png);
     png_read_update_info(png, info);
     pix = malloc((size_t)w * h * 4);
     rows = malloc(h * sizeof(png_bytep));
     if (!pix || !rows) png_error(png, "mem");
     for (png_uint_32 i = 0; i < h; i++) rows[i] = pix + (size_t)i * w * 4;
-    png_read_image(png, rows);
+    for (int pass = 0; pass < passes; pass++)
+        for (png_uint_32 i = 0; i < h; i++) {
+            png_read_row(png, rows[i], NULL);
+            if ((i & 15) == 15) audio_pump();
+        }
     png_destroy_read_struct(&png, &info, NULL);
     free(rows);
     fclose(fp);
@@ -359,7 +633,8 @@ static int load_png_ex(GSTEXTURE *t, const char *path, int maxw, int maxh, int s
     u32 *out = memalign(128, (size_t)dw * dh * 4);
     if (!out) { free(px); return -1; }
     float fx = (float)cw / dw, fy = (float)ch / dh;
-    for (int y = 0; y < dh; y++)
+    for (int y = 0; y < dh; y++) {
+        if ((y & 7) == 7) audio_pump();
         for (int x = 0; x < dw; x++) {
             float xa = x * fx, xb = xa + fx, ya = y * fy, yb = ya + fy;
             float sr = 0, sg = 0, sb = 0, sa = 0, area = 0;
@@ -383,6 +658,7 @@ static int load_png_ex(GSTEXTURE *t, const char *path, int maxw, int maxh, int s
             if (a8 > 255) a8 = 255;
             out[y * dw + x] = ((a8 * 128u + 127u) / 255u << 24) | (b << 16) | (g << 8) | r;   /* альфа GS: 0..0x80 */
         }
+    }
     free(px);
     t->Width = dw; t->Height = dh;
     t->PSM = GS_PSM_CT32;
@@ -833,7 +1109,7 @@ enum {
     L_ON, L_OFF, L_UNSAVED, L_SAVED, L_SAVEFAIL, L_NOGAMES, L_SRCSOON, L_LAUNCHSOON, L_SOON_PAGE,
     L_ASK_EXIT, L_ASK_POWER, L_YES, L_NO, L_NEEDRESTART, L_NOFONT, L_NOTRACKS, L_NOPOWEROFF,
     L_RESTARTFAIL, L_SOUNDSOON, L_HINT_GAMES, L_HINT_MENU, L_HINT_CONFIRM, L_PLAY,
-    L_KEEPVIDEO, L_REVERTIN, L_COUNT
+    L_KEEPVIDEO, L_REVERTIN, L_NOAUDIO, L_COUNT
 };
 static const char *const tr_tab[L_COUNT][2] = {
     [L_GAMES]       = { "Games", "Игры" },
@@ -881,6 +1157,7 @@ static const char *const tr_tab[L_COUNT][2] = {
     [L_HINT_CONFIRM]= { "\xE2\x9C\x95 Yes     \xE2\x97\x8B No", "\xE2\x9C\x95 Да     \xE2\x97\x8B Нет" },
     [L_PLAY]        = { "PS2", "PS2" },
     [L_KEEPVIDEO]   = { "Keep this video mode?", "Оставить этот видеорежим?" },
+    [L_NOAUDIO]     = { "Audio is not available", "Звук недоступен" },
     [L_REVERTIN]    = { "Reverting in %d s if no answer", "Автоотмена через %d с, если не ответить" },
 };
 #define T(id) (tr_tab[(id)][cfg.lang ? 1 : 0])
@@ -891,9 +1168,10 @@ static float toast_t;
 static void toast(const char *s) { snprintf(toast_msg, sizeof toast_msg, "%s", s); toast_t = 2.6f; }
 
 /* ---------- Выход, перезапуск, выключение ---------- */
-static void do_exit(void) { pads_close(); Exit(0); }
+static void do_exit(void) { audio_quit(); pads_close(); Exit(0); }
 static void do_poweroff(void) {
 #if HAVE_POWEROFF
+    audio_quit();
     pads_close();
     poweroffShutdown();
 #else
@@ -907,6 +1185,7 @@ static void do_restart(void) {
     norm_dev(self_path, p, sizeof p);
     if (!strcmp(self_path, "(none)")) snprintf(p, sizeof p, "%s/launcher.elf", app_dir);
     av[0] = p;
+    audio_quit();
     pads_close();
     LoadELFFromFile(p, 1, av);
     pads_open();                                   /* сюда попадаем, только если запуск не удался */
@@ -914,36 +1193,33 @@ static void do_restart(void) {
 }
 
 /* ---------- Меню настроек ---------- */
-enum { PG_ROOT, PG_SCREEN, PG_SOUND };
-static int   pg, cur[3];
+enum { PG_ROOT, PG_SCREEN, PG_SOUND, PG_TRACKS };
+static int   pg, cur[4];
 static int   set_open;                              /* 1 = меню открыто (или открывается) */
 static float set_anim;                              /* 0..1: вращение шестерёнки и появление панели */
 static int   confirm;                               /* 0 нет, 1 выход, 2 выключение */
-static char  tracks[MAX_TRACKS][48];
-static int   ntracks;
 
-static void scan_tracks(void) {
-    char path[160];
-    ntracks = 0;
-    snprintf(path, sizeof path, "%s/sound/music", app_dir);
-    DIR *d = opendir(path);
-    if (!d) return;
-    struct dirent *e;
-    while ((e = readdir(d)) && ntracks < MAX_TRACKS) {
-        size_t L = strlen(e->d_name);
-        if (L < 5 || L > 47 || strcasecmp(e->d_name + L - 4, ".wav")) continue;
-        snprintf(tracks[ntracks++], sizeof tracks[0], "%.47s", e->d_name);
-    }
-    closedir(d);
+static int page_count(int p) {
+    return p == PG_ROOT ? 6 : p == PG_SCREEN ? 6 : p == PG_SOUND ? 5 : ntracks + 1;
 }
-static int page_count(int p) { return p == PG_ROOT ? 6 : p == PG_SCREEN ? 6 : 5; }
 static const char *page_title(int p) {
-    return p == PG_ROOT ? T(L_SETTINGS) : p == PG_SCREEN ? T(L_SCREEN) : T(L_SOUND);
+    return p == PG_ROOT ? T(L_SETTINGS) : p == PG_SCREEN ? T(L_SCREEN) : p == PG_SOUND ? T(L_SOUND) : T(L_TRACK);
+}
+static void track_title(const char *file, char *out, size_t n) {      /* имя файла без .wav */
+    snprintf(out, n, "%s", file);
+    size_t L = strlen(out);
+    if (L > 4 && !strcasecmp(out + L - 4, ".wav")) out[L - 4] = 0;
 }
 static const char *item_label(int p, int i) {
     static const int root[]   = { L_SCREEN, L_SOUND, L_SAVE, L_RESTART, L_EXIT, L_POWEROFF };
     static const int screen[] = { L_LANGUAGE, L_TZ, L_CLOCKFMT, L_VIDEO, L_ASPECT, L_BACK };
     static const int sound[]  = { L_VOLUME, L_MUSIC, L_EFFECTS, L_TRACK, L_BACK };
+    static char name[64];
+    if (p == PG_TRACKS) {
+        if (i >= ntracks) return T(L_BACK);
+        track_title(tracks[i], name, sizeof name);
+        return name;
+    }
     return T(p == PG_ROOT ? root[i] : p == PG_SCREEN ? screen[i] : sound[i]);
 }
 /* значение справа; пустая строка = у пункта нет значения */
@@ -960,12 +1236,18 @@ static void item_value(int p, int i, char *out, size_t n) {
         case 4: snprintf(out, n, "\xE2\x97\x84 %s \xE2\x96\xBA", cfg.wide ? "16:9" : "4:3"); break;
         }
     } else if (p == PG_SOUND) {
+        char tn[64];
         switch (i) {
         case 0: snprintf(out, n, "\xE2\x97\x84 %d%% \xE2\x96\xBA", cfg.volume); break;
         case 1: snprintf(out, n, "\xE2\x97\x84 %s \xE2\x96\xBA", cfg.music_on ? T(L_ON) : T(L_OFF)); break;
         case 2: snprintf(out, n, "\xE2\x97\x84 %s \xE2\x96\xBA", cfg.fx_on ? T(L_ON) : T(L_OFF)); break;
-        case 3: snprintf(out, n, "\xE2\x97\x84 %.28s \xE2\x96\xBA", cfg.track[0] ? cfg.track : "-"); break;
+        case 3:
+            track_title(cfg.track[0] ? cfg.track : (ntracks ? tracks[0] : "-"), tn, sizeof tn);
+            snprintf(out, n, "%.24s", tn);
+            break;
         }
+    } else if (p == PG_TRACKS) {
+        if (i < ntracks && !strcmp(tracks[i], cfg.track[0] ? cfg.track : tracks[0])) snprintf(out, n, "\xE2\x96\xBA");
     } else if (p == PG_ROOT && i == 2 && cfg_dirty) {
         snprintf(out, n, "%s", T(L_UNSAVED) + 1);
     }
@@ -992,7 +1274,7 @@ static void item_adjust(int p, int i, int dir) {
     } else if (p == PG_SOUND) {
         switch (i) {
         case 0: cfg.volume = (int)clampf((float)(cfg.volume + dir * 10), 0, 100); break;
-        case 1: cfg.music_on ^= 1; break;
+        case 1: cfg.music_on ^= 1; audio_apply(); break;
         case 2: cfg.fx_on ^= 1; break;
         case 3:
             if (!ntracks) { toast(T(L_NOTRACKS)); changed = 0; break; }
@@ -1002,11 +1284,12 @@ static void item_adjust(int p, int i, int dir) {
                 if (!cfg.track[0]) c = dir > 0 ? -1 : 0;
                 c = ((c + dir) % ntracks + ntracks) % ntracks;
                 snprintf(cfg.track, sizeof cfg.track, "%s", tracks[c]);
+                audio_apply();
             }
             break;
         default: changed = 0;
         }
-        if (changed && i != 3) toast(T(L_SOUNDSOON));
+        if (changed && i < 3 && !audio_ok) toast(T(L_NOAUDIO));
     } else changed = 0;
     if (changed) cfg_dirty = 1;
 }
@@ -1022,30 +1305,47 @@ static void item_press(int p, int i) {
         }
     } else if (p == PG_SCREEN) {
         if (i == 5) pg = PG_ROOT; else item_adjust(p, i, 1);
+    } else if (p == PG_SOUND) {
+        if (i == 4) pg = PG_ROOT;
+        else if (i == 3) {
+            if (!ntracks) toast(T(L_NOTRACKS));
+            else {
+                pg = PG_TRACKS; cur[PG_TRACKS] = 0;
+                for (int k = 0; k < ntracks; k++) if (!strcmp(tracks[k], cfg.track)) cur[PG_TRACKS] = k;
+            }
+        } else item_adjust(p, i, 1);
     } else {
-        if (i == 4) pg = PG_ROOT; else item_adjust(p, i, 1);
+        if (i >= ntracks) pg = PG_SOUND;
+        else { snprintf(cfg.track, sizeof cfg.track, "%s", tracks[i]); cfg_dirty = 1; audio_apply(); }
     }
 }
 
 static void draw_settings(float a) {
     gsKit_prim_sprite(gs, 0, 0, gs->Width, gs->Height, 4, RGBA(0, 0, 0, 0.62f * a));
-    int n = page_count(pg);
+    int n = page_count(pg), vis = n > 7 ? 7 : n, first = 0;
+    if (n > vis) { first = cur[pg] - vis / 2; if (first < 0) first = 0; if (first > n - vis) first = n - vis; }
     float rowh = 42, pw = 520, px = (VW - pw) * 0.5f, py = 50;
-    float ph = 74 + n * rowh + 14, slide = (1.0f - a) * 26;
+    float ph = 74 + vis * rowh + 14, slide = (1.0f - a) * 26;
     rr_fill(px, py + slide, pw, ph, 16, RGBA(0x12, 0x16, 0x24, 1.0f * a));
     text(px + 30, py + slide + 22, 22, TXT(255, 255, 255, a), page_title(pg));
     fill_rect(px + 28, py + slide + 62, pw - 56, 2, RGBA(255, 255, 255, 0.18f * a));
-    for (int i = 0; i < n; i++) {
-        float y = py + slide + 74 + i * rowh;
-        char val[64];
+    for (int k = 0; k < vis; k++) {
+        int i = first + k;
+        float y = py + slide + 74 + k * rowh;
+        char val[64], lab[64];
         item_value(pg, i, val, sizeof val);
+        fit_text(lab, sizeof lab, item_label(pg, i), 22, pw - 120);
         if (i == cur[pg]) {
             rr_fill(px + 14, y, pw - 28, rowh - 6, 10, RGBA(255, 255, 255, 0.17f * a));
             rr_fill(px + 14, y + 6, 4, rowh - 18, 2, RGBA(255, 255, 255, 0.9f * a));
         }
         float ta = (i == cur[pg]) ? 1.0f : 0.72f;
-        text(px + 34, y + 8, 22, TXT(255, 255, 255, ta * a), item_label(pg, i));
-        if (val[0]) text_r(px + pw - 34, y + 8, 22, TXT(255, 255, 255, ta * a), val);
+        text(px + 34, y + 2, 22, TXT(255, 255, 255, ta * a), lab);
+        if (val[0]) text_r(px + pw - 34, y + 2, 22, TXT(255, 255, 255, ta * a), val);
+    }
+    if (n > vis) {                                              /* полоса прокрутки */
+        float th = (vis * rowh - 12) * vis / (float)n, ty = py + slide + 74 + (vis * rowh - 12 - th) * first / (float)(n - vis);
+        fill_rect(px + pw - 14, ty, 3, th, RGBA(255, 255, 255, 0.45f * a));
     }
     text_c(VW * 0.5f, VH - 36, 17, TXT(255, 255, 255, 0.75f * a), T(L_HINT_MENU));
 }
@@ -1163,11 +1463,14 @@ int main(int argc, char *argv[]) {
     scan_dir("DVD", 0);
     scan_dir("CD", 1);
     qsort(games, ngames, sizeof(Game), cmp_game);
+    scan_tracks();
+    audio_init();
 
     int sel = 0, idle = 0, bgFor = -1, lgoFor = -1, lap = 0;
     int tab = 0, src = 0, hold[4] = { 0, 0, 0, 0 }, pad_on[4] = { 0, 0, 0, 0 };
     u32 prev = 0xFFFF;
     unsigned frame = 0;
+    int intro_snd = 0, music_started = 0;
     GSTEXTURE bg;
     memset(&bg, 0, sizeof bg);
     Anim cam, titleA, titleY, bgA, tabPos, tabFade, srcA[5];
@@ -1194,24 +1497,29 @@ int main(int argc, char *argv[]) {
         if (intro_on) {
             if (pressed & (PAD_CROSS | PAD_START)) intro_t = t_part() + 3.0f;
         } else if (confirm == 3) {
-            if (pressed & PAD_CROSS) trial_keep();
-            if (pressed & PAD_CIRCLE) trial_revert();
+            if (pressed & PAD_CROSS) { sfx(FX_SELECT); trial_keep(); }
+            if (pressed & PAD_CIRCLE) { sfx(FX_BACK); trial_revert(); }
         } else if (confirm) {
-            if (pressed & PAD_CROSS) { int c = confirm; confirm = 0; if (c == 1) do_exit(); else do_poweroff(); }
-            if (pressed & PAD_CIRCLE) confirm = 0;
+            if (pressed & PAD_CROSS) { int c = confirm; confirm = 0; sfx(FX_SELECT); if (c == 1) do_exit(); else do_poweroff(); }
+            if (pressed & PAD_CIRCLE) { confirm = 0; sfx(FX_BACK); }
         } else if (set_open) {
             int n = page_count(pg);
-            if (fU) cur[pg] = (cur[pg] + n - 1) % n;
-            if (fD) cur[pg] = (cur[pg] + 1) % n;
-            if (fL) item_adjust(pg, cur[pg], -1);
-            if (fR) item_adjust(pg, cur[pg], +1);
-            if (pressed & PAD_CROSS) item_press(pg, cur[pg]);
-            if (pressed & PAD_CIRCLE) { if (pg != PG_ROOT) pg = PG_ROOT; else set_open = 0; }
-            if (pressed & PAD_START) set_open = 0;
+            if (fU) { cur[pg] = (cur[pg] + n - 1) % n; sfx(FX_MOVE); }
+            if (fD) { cur[pg] = (cur[pg] + 1) % n; sfx(FX_MOVE); }
+            if (fL) { item_adjust(pg, cur[pg], -1); sfx(FX_MOVE); }
+            if (fR) { item_adjust(pg, cur[pg], +1); sfx(FX_MOVE); }
+            if (pressed & PAD_CROSS) { sfx(FX_SELECT); item_press(pg, cur[pg]); }
+            if (pressed & PAD_CIRCLE) {
+                sfx(FX_BACK);
+                if (pg == PG_TRACKS) pg = PG_SOUND;
+                else if (pg != PG_ROOT) pg = PG_ROOT;
+                else set_open = 0;
+            }
+            if (pressed & PAD_START) { set_open = 0; sfx(FX_BACK); }
         } else {
-            if (pressed & PAD_START) { set_open = 1; pg = PG_ROOT; }
-            if (pressed & PAD_L1) { tab = (tab + 2) % 3; tabFade.v = 0; anim_to(&tabFade, 1); }
-            if (pressed & PAD_R1) { tab = (tab + 1) % 3; tabFade.v = 0; anim_to(&tabFade, 1); }
+            if (pressed & PAD_START) { set_open = 1; pg = PG_ROOT; sfx(FX_OPEN); }
+            if (pressed & PAD_L1) { tab = (tab + 2) % 3; tabFade.v = 0; anim_to(&tabFade, 1); sfx(FX_TAB); }
+            if (pressed & PAD_R1) { tab = (tab + 1) % 3; tabFade.v = 0; anim_to(&tabFade, 1); sfx(FX_TAB); }
             if (tab == 0) {
                 int move = fR ? 1 : fL ? -1 : 0;
                 if (move && nvis > 0) {
@@ -1222,6 +1530,7 @@ int main(int argc, char *argv[]) {
                     for (int i = 0; i < nvis; i++) total += lerpf(TILE_S, TILE_L, games[i].scale.v) + GAP;
                     if (total >= VW) lap += wrap;                    /* бесшовная петля только если список длиннее экрана */
                     sel = ns; idle = 0;
+                    sfx(FX_MOVE);
                     titleA.v = 0; anim_to(&titleA, 1);
                     titleY.v = 8; anim_to(&titleY, 0);
                     lgo_state = 0;
@@ -1230,17 +1539,23 @@ int main(int argc, char *argv[]) {
                 int ds = fD ? 1 : fU ? -1 : 0;
                 if (ds) {
                     src = (src + ds + 5) % 5;
+                    sfx(FX_MOVE);
                     sel = 0; lap = 0; idle = 0; cam.v = cam.t = 0;
                     lgo_state = 0; anim_to(&bgA, 0);
                 }
-                if ((pressed & PAD_CROSS) && nvis > 0) toast(T(L_LAUNCHSOON));
+                if ((pressed & PAD_CROSS) && nvis > 0) { sfx(FX_SELECT); toast(T(L_LAUNCHSOON)); }
             }
         }
         idle++;
 
         /* --- анимации и состояние --- */
-        if (intro_on) intro_update();
-        else if (logo_ok) { free_tex(&logo_tex); logo_ok = 0; }
+        if (intro_on) {
+            if (!intro_snd && intro_t >= 0.2f) { intro_snd = 1; sfx(FX_INTRO); }
+            intro_update();
+        } else {
+            if (logo_ok) { free_tex(&logo_tex); logo_ok = 0; }
+            if (!music_started) { music_started = 1; audio_apply(); }
+        }
         if (set_open) set_anim = clampf(set_anim + dt / 0.55f, 0, 1);
         else          set_anim = clampf(set_anim - dt / 0.30f, 0, 1);
         if (toast_t > 0) toast_t -= dt;
@@ -1420,6 +1735,7 @@ int main(int argc, char *argv[]) {
         }
         if (intro_on) draw_intro();
 
+        audio_pump();
         gsKit_queue_exec(gs);
         gsKit_sync_flip(gs);
         gsKit_TexManager_nextFrame(gs);
