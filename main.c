@@ -89,13 +89,13 @@ typedef struct {
     char extra[64], extra2[64];
     int  lang;                     /* 0 = English, 1 = Русский */
     int  tz;                       /* GMT-сдвиг в минутах */
-    int  clock24, volume, music_on, fx_on;
+    int  clock24, volume, music_on, fx_on, music_vol, fx_vol;
     char track[64];
     int  vtry;                     /* видеорежим на пробу при следующем запуске, -1 = нет */
 } Config;
 /* video: 0 auto, 1 ntsc, 2 pal, 3 480p, 4 720p, 5 1080i */
 #define NVIDEO 6
-static Config cfg = { 0, 1, 0, 0, 0, 0, "", "", 1, 180, 1, 80, 1, 1, "", -1 };
+static Config cfg = { 0, 1, 0, 0, 0, 0, "", "", 1, 180, 1, 80, 1, 1, 100, 100, "", -1 };
 
 static GSGLOBAL *gs;
 static GSFONTM  *fontm;
@@ -240,6 +240,8 @@ static void cfg_set(const char *k, const char *v) {
     else if (!strcasecmp(k, "clock24"))    cfg.clock24  = atoi(v) != 0;
     else if (!strcasecmp(k, "volume"))     cfg.volume   = (int)clampf((float)atoi(v), 0, 100);
     else if (!strcasecmp(k, "music"))      cfg.music_on = atoi(v) != 0;
+    else if (!strcasecmp(k, "musicvol"))   cfg.music_vol = (int)clampf((float)atoi(v), 0, 100);
+    else if (!strcasecmp(k, "fxvol"))      cfg.fx_vol    = (int)clampf((float)atoi(v), 0, 100);
     else if (!strcasecmp(k, "effects"))    cfg.fx_on    = atoi(v) != 0;
     else if (!strcasecmp(k, "track"))      snprintf(cfg.track, sizeof cfg.track, "%s", v);
 }
@@ -289,7 +291,7 @@ static int save_cfg(void) {
     fprintf(f, "tz=%d\n", cfg.tz);
     fprintf(f, "clock24=%d\n", cfg.clock24);
     fprintf(f, "volume=%d\n", cfg.volume);
-    fprintf(f, "music=%d\n", cfg.music_on);
+    fprintf(f, "music=%d\nmusicvol=%d\nfxvol=%d\n", cfg.music_on, cfg.music_vol, cfg.fx_vol);
     fprintf(f, "effects=%d\n", cfg.fx_on);
     fprintf(f, "track=%s\n", cfg.track);
     fprintf(f, "debug=%d\n", cfg.debug);
@@ -470,6 +472,7 @@ static void music_play(const char *name) {
 }
 static void fx_load(int id) {
     char p[200];
+    if (fx[id].pcm) return;
     Src s;
     int o[2];
     unsigned n = 0, cap = OUT_RATE * 4;                 /* эффект не длиннее 4 секунд */
@@ -515,8 +518,8 @@ static void audio_pump(void) {
     frames = avail / 4;
     if (frames > 2048) frames = 2048;
     lv = (float)cfg.volume / 100.0f; lv *= lv;
-    mt = (mus_want && mus_open) ? lv * 0.6f : 0.0f;
-    fg = (int)(lv * 256.0f);
+    mt = (mus_want && mus_open) ? lv * ((float)cfg.music_vol / 100.0f) * ((float)cfg.music_vol / 100.0f) * 0.6f : 0.0f;
+    fg = (int)(lv * ((float)cfg.fx_vol / 100.0f) * ((float)cfg.fx_vol / 100.0f) * 256.0f);
     for (int i = 0; i < frames; i++) {
         int l = 0, r = 0, o[2], mg;
         mus_gain += (mt - mus_gain) * 0.0001f;
@@ -548,6 +551,7 @@ static void audio_init(void) {
     for (int i = 0; i < FX_COUNT; i++) fx_load(i);
 #endif
 }
+static void audio_quit(void);
 static void audio_quit(void) {
 #if HAVE_AUDIO
     if (!audio_ok) return;
@@ -1109,7 +1113,10 @@ enum {
     L_ON, L_OFF, L_UNSAVED, L_SAVED, L_SAVEFAIL, L_NOGAMES, L_SRCSOON, L_LAUNCHSOON, L_SOON_PAGE,
     L_ASK_EXIT, L_ASK_POWER, L_YES, L_NO, L_NEEDRESTART, L_NOFONT, L_NOTRACKS, L_NOPOWEROFF,
     L_RESTARTFAIL, L_SOUNDSOON, L_HINT_GAMES, L_HINT_MENU, L_HINT_CONFIRM, L_PLAY,
-    L_KEEPVIDEO, L_REVERTIN, L_NOAUDIO, L_COUNT
+    L_KEEPVIDEO, L_REVERTIN, L_NOAUDIO, L_MUSICVOL, L_FXVOL,
+    L_STORAGE, L_NODEV, L_GAMESN, L_APPSN, L_NOAPPS, L_SCANNING, L_FOUND, L_EMPTYDIR, L_ACTIONS, L_COPY, L_CUT, L_PASTE, L_DELETE,
+    L_CANCEL, L_ASKDEL, L_CLIPCOPY, L_CLIPMOVE, L_OPDONE, L_OPFAIL, L_CANCELLED, L_COPYING, L_MOVING, L_DELETING, L_ELFFAIL,
+    L_HINT_DEVS, L_HINT_APPS, L_HINT_FILES, L_HINT_CANCEL, L_INTOSELF, L_COPIED, L_MARKED, L_COUNT
 };
 static const char *const tr_tab[L_COUNT][2] = {
     [L_GAMES]       = { "Games", "Игры" },
@@ -1157,6 +1164,42 @@ static const char *const tr_tab[L_COUNT][2] = {
     [L_HINT_CONFIRM]= { "\xE2\x9C\x95 Yes     \xE2\x97\x8B No", "\xE2\x9C\x95 Да     \xE2\x97\x8B Нет" },
     [L_PLAY]        = { "PS2", "PS2" },
     [L_KEEPVIDEO]   = { "Keep this video mode?", "Оставить этот видеорежим?" },
+    [L_MUSICVOL]    = { "Music volume", "Громкость музыки" },
+    [L_FXVOL]       = { "Effects volume", "Громкость эффектов" },
+    [L_STORAGE]     = { "Storage devices", "Устройства хранения" },
+    [L_NODEV]       = { "No storage devices found (\xE2\x96\xA1 to refresh)", "Устройства не найдены (\xE2\x96\xA1 обновить)" },
+    [L_GAMESN]      = { "Games: %d", "Игр: %d" },
+    [L_APPSN]       = { "Apps: %d", "Приложений: %d" },
+    [L_NOAPPS]      = { "No ELF applications found on this device", "На устройстве нет ELF-приложений" },
+    [L_SCANNING]    = { "Scanning device...", "Сканирование устройства..." },
+    [L_FOUND]       = { "Found: %d", "Найдено: %d" },
+    [L_EMPTYDIR]    = { "Folder is empty", "Папка пуста" },
+    [L_ACTIONS]     = { "Actions", "Действия" },
+    [L_COPY]        = { "Copy", "Копировать" },
+    [L_CUT]         = { "Move", "Переместить" },
+    [L_PASTE]       = { "Paste here", "Вставить сюда" },
+    [L_DELETE]      = { "Delete", "Удалить" },
+    [L_CANCEL]      = { "Cancel", "Отмена" },
+    [L_ASKDEL]      = { "Delete %d item(s) permanently?", "Удалить без восстановления (%d)?" },
+    [L_CLIPCOPY]    = { "Clipboard: %d to copy", "Буфер: %d (копирование)" },
+    [L_CLIPMOVE]    = { "Clipboard: %d to move", "Буфер: %d (перемещение)" },
+    [L_OPDONE]      = { "Done", "Готово" },
+    [L_OPFAIL]      = { "Error", "Ошибка" },
+    [L_CANCELLED]   = { "Cancelled", "Отменено" },
+    [L_COPYING]     = { "Copying", "Копирование" },
+    [L_MOVING]      = { "Moving", "Перемещение" },
+    [L_DELETING]    = { "Deleting", "Удаление" },
+    [L_ELFFAIL]     = { "Could not start the ELF", "Не удалось запустить ELF" },
+    [L_HINT_DEVS]   = { "\xE2\x97\x84\xE2\x96\xBA Select     \xE2\x9C\x95 Open     \xE2\x96\xA1 Refresh     L1 / R1 Tabs",
+                        "\xE2\x97\x84\xE2\x96\xBA Выбор     \xE2\x9C\x95 Открыть     \xE2\x96\xA1 Обновить     L1 / R1 Вкладки" },
+    [L_HINT_APPS]   = { "\xE2\x96\xB2\xE2\x96\xBC Select     \xE2\x9C\x95 Launch     \xE2\x96\xA1 Rescan     \xE2\x97\x8B Back",
+                        "\xE2\x96\xB2\xE2\x96\xBC Выбор     \xE2\x9C\x95 Запуск     \xE2\x96\xA1 Заново     \xE2\x97\x8B Назад" },
+    [L_HINT_FILES]  = { "\xE2\x9C\x95 Open     \xE2\x96\xA1 Mark     \xE2\x96\xB3 Actions     \xE2\x97\x8B Back",
+                        "\xE2\x9C\x95 Открыть     \xE2\x96\xA1 Отметить     \xE2\x96\xB3 Действия     \xE2\x97\x8B Назад" },
+    [L_HINT_CANCEL] = { "\xE2\x97\x8B Cancel", "\xE2\x97\x8B Отмена" },
+    [L_INTOSELF]    = { "Cannot paste a folder into itself", "Нельзя вставить папку саму в себя" },
+    [L_COPIED]      = { "Items in clipboard: %d", "Элементов в буфере: %d" },
+    [L_MARKED]      = { "Marked: %d", "Отмечено: %d" },
     [L_NOAUDIO]     = { "Audio is not available", "Звук недоступен" },
     [L_REVERTIN]    = { "Reverting in %d s if no answer", "Автоотмена через %d с, если не ответить" },
 };
@@ -1168,6 +1211,7 @@ static float toast_t;
 static void toast(const char *s) { snprintf(toast_msg, sizeof toast_msg, "%s", s); toast_t = 2.6f; }
 
 /* ---------- Выход, перезапуск, выключение ---------- */
+static void audio_restart(void);
 static void do_exit(void) { audio_quit(); pads_close(); Exit(0); }
 static void do_poweroff(void) {
 #if HAVE_POWEROFF
@@ -1189,6 +1233,7 @@ static void do_restart(void) {
     pads_close();
     LoadELFFromFile(p, 1, av);
     pads_open();                                   /* сюда попадаем, только если запуск не удался */
+    audio_restart();
     toast(T(L_RESTARTFAIL));
 }
 
@@ -1200,7 +1245,7 @@ static float set_anim;                              /* 0..1: вращение ш
 static int   confirm;                               /* 0 нет, 1 выход, 2 выключение */
 
 static int page_count(int p) {
-    return p == PG_ROOT ? 6 : p == PG_SCREEN ? 6 : p == PG_SOUND ? 5 : ntracks + 1;
+    return p == PG_ROOT ? 6 : p == PG_SCREEN ? 6 : p == PG_SOUND ? 7 : ntracks + 1;
 }
 static const char *page_title(int p) {
     return p == PG_ROOT ? T(L_SETTINGS) : p == PG_SCREEN ? T(L_SCREEN) : p == PG_SOUND ? T(L_SOUND) : T(L_TRACK);
@@ -1213,7 +1258,7 @@ static void track_title(const char *file, char *out, size_t n) {      /* имя 
 static const char *item_label(int p, int i) {
     static const int root[]   = { L_SCREEN, L_SOUND, L_SAVE, L_RESTART, L_EXIT, L_POWEROFF };
     static const int screen[] = { L_LANGUAGE, L_TZ, L_CLOCKFMT, L_VIDEO, L_ASPECT, L_BACK };
-    static const int sound[]  = { L_VOLUME, L_MUSIC, L_EFFECTS, L_TRACK, L_BACK };
+    static const int sound[]  = { L_VOLUME, L_MUSIC, L_MUSICVOL, L_EFFECTS, L_FXVOL, L_TRACK, L_BACK };
     static char name[64];
     if (p == PG_TRACKS) {
         if (i >= ntracks) return T(L_BACK);
@@ -1240,8 +1285,10 @@ static void item_value(int p, int i, char *out, size_t n) {
         switch (i) {
         case 0: snprintf(out, n, "\xE2\x97\x84 %d%% \xE2\x96\xBA", cfg.volume); break;
         case 1: snprintf(out, n, "\xE2\x97\x84 %s \xE2\x96\xBA", cfg.music_on ? T(L_ON) : T(L_OFF)); break;
-        case 2: snprintf(out, n, "\xE2\x97\x84 %s \xE2\x96\xBA", cfg.fx_on ? T(L_ON) : T(L_OFF)); break;
-        case 3:
+        case 2: snprintf(out, n, "\xE2\x97\x84 %d%% \xE2\x96\xBA", cfg.music_vol); break;
+        case 3: snprintf(out, n, "\xE2\x97\x84 %s \xE2\x96\xBA", cfg.fx_on ? T(L_ON) : T(L_OFF)); break;
+        case 4: snprintf(out, n, "\xE2\x97\x84 %d%% \xE2\x96\xBA", cfg.fx_vol); break;
+        case 5:
             track_title(cfg.track[0] ? cfg.track : (ntracks ? tracks[0] : "-"), tn, sizeof tn);
             snprintf(out, n, "%.24s", tn);
             break;
@@ -1275,8 +1322,10 @@ static void item_adjust(int p, int i, int dir) {
         switch (i) {
         case 0: cfg.volume = (int)clampf((float)(cfg.volume + dir * 10), 0, 100); break;
         case 1: cfg.music_on ^= 1; audio_apply(); break;
-        case 2: cfg.fx_on ^= 1; break;
-        case 3:
+        case 2: cfg.music_vol = (int)clampf((float)(cfg.music_vol + dir * 10), 0, 100); break;
+        case 3: cfg.fx_on ^= 1; break;
+        case 4: cfg.fx_vol = (int)clampf((float)(cfg.fx_vol + dir * 10), 0, 100); break;
+        case 5:
             if (!ntracks) { toast(T(L_NOTRACKS)); changed = 0; break; }
             {
                 int c = 0;
@@ -1289,7 +1338,7 @@ static void item_adjust(int p, int i, int dir) {
             break;
         default: changed = 0;
         }
-        if (changed && i < 3 && !audio_ok) toast(T(L_NOAUDIO));
+        if (changed && i < 5 && !audio_ok) toast(T(L_NOAUDIO));
     } else changed = 0;
     if (changed) cfg_dirty = 1;
 }
@@ -1306,8 +1355,8 @@ static void item_press(int p, int i) {
     } else if (p == PG_SCREEN) {
         if (i == 5) pg = PG_ROOT; else item_adjust(p, i, 1);
     } else if (p == PG_SOUND) {
-        if (i == 4) pg = PG_ROOT;
-        else if (i == 3) {
+        if (i == 6) pg = PG_ROOT;
+        else if (i == 5) {
             if (!ntracks) toast(T(L_NOTRACKS));
             else {
                 pg = PG_TRACKS; cur[PG_TRACKS] = 0;
@@ -1349,6 +1398,7 @@ static void draw_settings(float a) {
     }
     text_c(VW * 0.5f, VH - 36, 17, TXT(255, 255, 255, 0.75f * a), T(L_HINT_MENU));
 }
+static int fm_del_n;
 static void trial_keep(void) {
     cfg.video = run_video; cfg.vtry = -1; trial_on = 0; confirm = 0;
     toast(save_cfg() == 0 ? T(L_SAVED) : T(L_SAVEFAIL));
@@ -1369,8 +1419,620 @@ static void draw_confirm(void) {
         text_c(VW * 0.5f, y + 92, 17, TXT(255, 255, 255, 0.75f), T(L_HINT_CONFIRM));
         return;
     }
+    if (confirm == 4) {
+        char q[96];
+        snprintf(q, sizeof q, T(L_ASKDEL), fm_del_n);
+        text_c(VW * 0.5f, y + 28, 22, TXT(255, 255, 255, 1), q);
+        text_c(VW * 0.5f, y + 82, 17, TXT(255, 255, 255, 0.75f), T(L_HINT_CONFIRM));
+        return;
+    }
     text_c(VW * 0.5f, y + 28, 22, TXT(255, 255, 255, 1), confirm == 1 ? T(L_ASK_EXIT) : T(L_ASK_POWER));
     text_c(VW * 0.5f, y + 82, 17, TXT(255, 255, 255, 0.75f), T(L_HINT_CONFIRM));
+}
+
+/* ---------- Устройства, приложения (все ELF на устройстве), файловый менеджер ---------- */
+#ifndef FIO_S_ISDIR
+#define FIO_S_ISDIR(m) (((m) & 0xF000) == 0x1000)
+#endif
+#define MAXF     2048
+#define MAXAPPS  400
+#define MAXCLIP  64
+#define IOBUF    (64 * 1024)
+#define LIST_ROWS 8
+
+typedef struct { char prefix[12]; char name[16]; int unit, napps; } Dev;
+typedef struct { char name[120]; u64 size; unsigned char dir, mark; } FEnt;
+typedef struct { char path[200]; } AppEnt;
+typedef struct { char path[256]; int dir; } Item;
+
+static Dev     devs[4];
+static int     ndevs;
+static FEnt   *fe;
+static int     nfe;
+static AppEnt *apps;
+static int     napp, a_scanned = -1, a_tile, a_open, a_sel;
+static int     f_tile, f_open, f_sel;
+static char    fpath[256];
+static Item    clip[MAXCLIP], del_list[MAXCLIP];
+static int     nclip, clip_move, ndel, fm_menu, fm_cur;
+static int     acts[5], nact;
+enum { A_COPY, A_CUT, A_PASTE, A_DEL, A_CANCEL };
+
+/* --- пути и размеры --- */
+static void path_join(char *dst, size_t n, const char *dir, const char *name) {
+    size_t L = strlen(dir);
+    snprintf(dst, n, "%s%s%s", dir, (L && dir[L - 1] == '/') ? "" : "/", name);
+}
+static int path_is_root(const char *p) {
+    const char *c = strchr(p, ':');
+    return c && (c[1] == 0 || (c[1] == '/' && c[2] == 0));
+}
+static void path_up(char *p) {
+    size_t L = strlen(p);
+    char *colon = strchr(p, ':'), *sl;
+    while (L > 1 && p[L - 1] == '/') p[--L] = 0;
+    sl = strrchr(p, '/');
+    if (!sl) return;
+    if (colon && sl == colon + 1) sl[1] = 0; else *sl = 0;
+}
+static const char *base_name(const char *p) { const char *s = strrchr(p, '/'); return s ? s + 1 : p; }
+static void fmt_size(u64 v, char *out, size_t n) {
+    if (v < 1024ULL) snprintf(out, n, "%u B", (unsigned)v);
+    else if (v < 1048576ULL) snprintf(out, n, "%.1f KB", (double)v / 1024.0);
+    else if (v < 1073741824ULL) snprintf(out, n, "%.1f MB", (double)v / 1048576.0);
+    else snprintf(out, n, "%.2f GB", (double)v / 1073741824.0);
+}
+static int dev_unit(const char *p) {                      /* "mass:" -> 0, "mass2:" -> 2 */
+    if (strncasecmp(p, "mass", 4)) return -1;
+    if (p[4] == ':') return 0;
+    if (p[4] >= '0' && p[4] <= '9' && p[5] == ':') return p[4] - '0';
+    return -1;
+}
+static int path_exists(const char *p) { iox_stat_t st; return fileXioGetstat(p, &st) >= 0; }
+
+typedef int (*DirCb)(const char *name, const iox_stat_t *st, void *ud);
+/* перебор каталога; обратный вызов вернул != 0 -> прервать (результат > 0); -1 = не открылся */
+static int dir_each(const char *path, DirCb cb, void *ud) {
+    iox_dirent_t de;
+    int rc = 0, fd = fileXioDopen(path);
+    if (fd < 0) return -1;
+    while (fileXioDread(fd, &de) > 0) {
+        if (!strcmp(de.name, ".") || !strcmp(de.name, "..")) continue;
+        rc = cb(de.name, &de.stat, ud);
+        if (rc) break;
+    }
+    fileXioDclose(fd);
+    return rc;
+}
+
+/* --- устройства --- */
+static void devs_probe(void) {
+    ndevs = 0;
+    for (int u = 0; u < 4; u++) {
+        char p[16], root[20];
+        if (u == 0) snprintf(p, sizeof p, "mass:"); else snprintf(p, sizeof p, "mass%d:", u);
+        snprintf(root, sizeof root, "%s/", p);
+        if (!exists_dir(root)) continue;
+        Dev *d = &devs[ndevs++];
+        snprintf(d->prefix, sizeof d->prefix, "%s", p);
+        snprintf(d->name, sizeof d->name, "USB %d", u + 1);
+        d->unit = u;
+        d->napps = -1;
+    }
+    if (a_tile >= ndevs) a_tile = 0;
+    if (f_tile >= ndevs) f_tile = 0;
+    a_scanned = -1; a_open = 0; f_open = 0;
+}
+
+/* --- окно прогресса: рисует кадр, подкармливает звук, ловит ○ --- */
+static int  op_cancel, g_resync, op_ticks;
+static u32  op_prev = 0xFFFF;
+static char op_title[48], op_l1[260], op_l2[96], op_err[64];
+static float op_frac = -1.0f;
+
+static void progress_draw(void) {
+    float w = 600, h = 200, x = (VW - w) * 0.5f, y = 140;
+    char l1[96];
+    gsKit_clear(gs, RGBA(0x08, 0x0C, 0x18, 1));
+    rr_fill(x, y, w, h, 18, RGBA(0x14, 0x18, 0x28, 1.0f));
+    text(x + 30, y + 20, 22, TXT(255, 255, 255, 1), op_title);
+    fit_text(l1, sizeof l1, op_l1, 17, w - 60);
+    text(x + 30, y + 66, 17, TXT(210, 210, 220, 1), l1);
+    text(x + 30, y + 92, 17, TXT(180, 180, 190, 1), op_l2);
+    rr_fill(x + 30, y + 130, w - 60, 10, 5, RGBA(255, 255, 255, 0.18f));
+    if (op_frac >= 0) rr_fill(x + 30, y + 130, fmaxf(10.0f, (w - 60) * clampf(op_frac, 0, 1)), 10, 5, RGBA(255, 255, 255, 0.9f));
+    text_c(VW * 0.5f, y + 160, 17, TXT(255, 255, 255, 0.7f), T(L_HINT_CANCEL));
+}
+static int progress_tick(void) {
+    u32 b = read_buttons();
+    if ((b & ~op_prev) & PAD_CIRCLE) op_cancel = 1;
+    op_prev = b;
+    progress_draw();
+    audio_pump();
+    gsKit_queue_exec(gs);
+    gsKit_sync_flip(gs);
+    gsKit_TexManager_nextFrame(gs);
+    return op_cancel;
+}
+static void op_begin(const char *title) {
+    snprintf(op_title, sizeof op_title, "%s", title);
+    op_l1[0] = op_l2[0] = 0; op_err[0] = 0;
+    op_frac = -1.0f; op_cancel = 0; op_ticks = 0;
+    op_prev = read_buttons();
+    g_resync = 1;
+}
+
+/* --- приложения: поиск всех .elf на устройстве --- */
+typedef struct { char path[256]; int depth; } ScanCtx;
+static const char *const SKIP_DIRS[] = { "System Volume Information", "$RECYCLE.BIN", "RECYCLER", "lost+found", NULL };
+static int scan_rec(const char *path, int depth);
+static int scan_cb(const char *name, const iox_stat_t *st, void *ud) {
+    const ScanCtx *c = (const ScanCtx *)ud;
+    size_t L = strlen(name);
+    if (op_cancel || napp >= MAXAPPS) return 1;
+    if ((++op_ticks & 31) == 0) {
+        snprintf(op_l1, sizeof op_l1, "%s", c->path);
+        snprintf(op_l2, sizeof op_l2, T(L_FOUND), napp);
+        if (progress_tick()) return 1;
+    }
+    if (FIO_S_ISDIR(st->mode)) {
+        char sub[256];
+        if (c->depth >= 10) return 0;
+        for (int i = 0; SKIP_DIRS[i]; i++) if (!strcasecmp(name, SKIP_DIRS[i])) return 0;
+        path_join(sub, sizeof sub, c->path, name);
+        return scan_rec(sub, c->depth + 1);
+    }
+    if (L > 4 && !strcasecmp(name + L - 4, ".elf")) {
+        char full[256];
+        path_join(full, sizeof full, c->path, name);
+        if (strlen(full) < sizeof apps[0].path) snprintf(apps[napp++].path, sizeof apps[0].path, "%s", full);
+    }
+    return 0;
+}
+static int scan_rec(const char *path, int depth) {
+    ScanCtx c;
+    int rc;
+    snprintf(c.path, sizeof c.path, "%s", path);
+    c.depth = depth;
+    rc = dir_each(path, scan_cb, &c);
+    return rc > 0;
+}
+static int app_cmp(const void *a, const void *b) {
+    const AppEnt *x = (const AppEnt *)a, *y = (const AppEnt *)b;
+    int r = strcasecmp(base_name(x->path), base_name(y->path));
+    return r ? r : strcasecmp(x->path, y->path);
+}
+static void apps_scan(int di) {
+    char root[20];
+    op_begin(T(L_SCANNING));
+    napp = 0;
+    snprintf(root, sizeof root, "%s/", devs[di].prefix);
+    scan_rec(root, 0);
+    qsort(apps, (size_t)napp, sizeof(AppEnt), app_cmp);
+    a_scanned = op_cancel ? -1 : di;
+    devs[di].napps = napp;
+    a_sel = 0;
+    op_cancel = 0;
+}
+static void audio_restart(void) { audio_init(); audio_apply(); }
+static void launch_elf(const char *path) {
+    static char pbuf[260];
+    char *av[1];
+    snprintf(pbuf, sizeof pbuf, "%s", path);
+    av[0] = pbuf;
+    audio_quit();
+    pads_close();
+    LoadELFFromFile(pbuf, 1, av);
+    pads_open();                                      /* сюда попадаем, только если запуск не удался */
+    audio_restart();
+    toast(T(L_ELFFAIL));
+}
+
+/* --- файловый менеджер --- */
+static int fe_cmp(const void *a, const void *b) {
+    const FEnt *x = (const FEnt *)a, *y = (const FEnt *)b;
+    if (x->dir != y->dir) return (int)y->dir - (int)x->dir;
+    return strcasecmp(x->name, y->name);
+}
+static int list_cb(const char *name, const iox_stat_t *st, void *ud) {
+    (void)ud;
+    if (nfe >= MAXF || strlen(name) >= sizeof fe[0].name) return 0;
+    FEnt *e = &fe[nfe++];
+    snprintf(e->name, sizeof e->name, "%s", name);
+    e->dir = FIO_S_ISDIR(st->mode) ? 1 : 0;
+    e->size = ((u64)st->hisize << 32) | st->size;
+    e->mark = 0;
+    return 0;
+}
+static void list_dir(void) {
+    nfe = 0;
+    dir_each(fpath, list_cb, NULL);
+    qsort(fe, (size_t)nfe, sizeof(FEnt), fe_cmp);
+    if (f_sel >= nfe) f_sel = nfe ? nfe - 1 : 0;
+}
+static unsigned char *iobuf;
+static u64 op_total, op_done;
+static void op_progress_line(void) {
+    char a[24], b[24];
+    fmt_size(op_done, a, sizeof a);
+    fmt_size(op_total, b, sizeof b);
+    snprintf(op_l2, sizeof op_l2, "%s / %s", a, b);
+    op_frac = op_total ? (float)((double)op_done / (double)op_total) : -1.0f;
+}
+static int copy_file(const char *src, const char *dst) {
+    FILE *in = fopen(src, "rb"), *out;
+    size_t n;
+    int rc = 0;
+    if (!in) { snprintf(op_err, sizeof op_err, "open"); return -1; }
+    out = fopen(dst, "wb");
+    if (!out) { fclose(in); snprintf(op_err, sizeof op_err, "create"); return -1; }
+    while ((n = fread(iobuf, 1, IOBUF, in)) > 0) {
+        if (fwrite(iobuf, 1, n, out) != n) { snprintf(op_err, sizeof op_err, "write (disk full / 4 GB)"); rc = -1; break; }
+        op_done += n;
+        op_progress_line();
+        if (progress_tick()) { rc = -2; break; }
+    }
+    fclose(in);
+    if (fclose(out) != 0 && !rc) { snprintf(op_err, sizeof op_err, "write"); rc = -1; }
+    if (rc) fileXioRemove(dst);                        /* не оставлять недокопированный файл */
+    return rc;
+}
+typedef struct { char src[256], dst[256]; } CopyCtx;
+static int copy_entry(const char *src, const char *dst, int is_dir);
+static int copy_cb(const char *name, const iox_stat_t *st, void *ud) {
+    const CopyCtx *c = (const CopyCtx *)ud;
+    char s[256], d[256];
+    path_join(s, sizeof s, c->src, name);
+    path_join(d, sizeof d, c->dst, name);
+    return copy_entry(s, d, FIO_S_ISDIR(st->mode) ? 1 : 0) != 0;
+}
+static int copy_entry(const char *src, const char *dst, int is_dir) {
+    CopyCtx c;
+    int rc;
+    if (op_cancel) return -2;
+    snprintf(op_l1, sizeof op_l1, "%s", src);
+    if (!is_dir) return copy_file(src, dst);
+    if (fileXioMkdir(dst, 0777) < 0 && !path_exists(dst)) { snprintf(op_err, sizeof op_err, "mkdir"); return -1; }
+    snprintf(c.src, sizeof c.src, "%s", src);
+    snprintf(c.dst, sizeof c.dst, "%s", dst);
+    rc = dir_each(src, copy_cb, &c);
+    return rc > 0 ? (op_cancel ? -2 : -1) : 0;
+}
+static int del_entry(const char *path, int is_dir);
+static int del_dir_contents(const char *path) {
+    for (;;) {
+        char names[32][96];
+        unsigned char isd[32];
+        int n = 0, fd = fileXioDopen(path);
+        iox_dirent_t de;
+        if (fd < 0) { snprintf(op_err, sizeof op_err, "open dir"); return -1; }
+        while (n < 32 && fileXioDread(fd, &de) > 0) {
+            if (!strcmp(de.name, ".") || !strcmp(de.name, "..")) continue;
+            if (strlen(de.name) >= sizeof names[0]) { fileXioDclose(fd); snprintf(op_err, sizeof op_err, "name too long"); return -1; }
+            snprintf(names[n], sizeof names[0], "%s", de.name);
+            isd[n++] = FIO_S_ISDIR(de.stat.mode) ? 1 : 0;
+        }
+        fileXioDclose(fd);
+        if (n == 0) return 0;
+        for (int i = 0; i < n; i++) {
+            char full[256];
+            int rc;
+            path_join(full, sizeof full, path, names[i]);
+            rc = del_entry(full, isd[i]);
+            if (rc) return rc;
+        }
+    }
+}
+static int del_entry(const char *path, int is_dir) {
+    int rc;
+    if (op_cancel) return -2;
+    snprintf(op_l1, sizeof op_l1, "%s", path);
+    if ((++op_ticks & 3) == 0 && progress_tick()) return -2;
+    if (is_dir) {
+        rc = del_dir_contents(path);
+        if (rc) return rc;
+        if (fileXioRmdir(path) < 0) { snprintf(op_err, sizeof op_err, "rmdir"); return -1; }
+        return 0;
+    }
+    if (fileXioRemove(path) < 0) { snprintf(op_err, sizeof op_err, "delete"); return -1; }
+    return 0;
+}
+static u64 ts_acc;
+static int ts_cb(const char *name, const iox_stat_t *st, void *ud) {
+    if (op_cancel) return 1;
+    if (FIO_S_ISDIR(st->mode)) {
+        char sub[256];
+        path_join(sub, sizeof sub, (const char *)ud, name);
+        return dir_each(sub, ts_cb, sub) > 0;
+    }
+    ts_acc += ((u64)st->hisize << 32) | st->size;
+    if ((++op_ticks & 31) == 0 && progress_tick()) return 1;
+    return 0;
+}
+static u64 item_size(const Item *it) {
+    iox_stat_t st;
+    if (!it->dir) return fileXioGetstat(it->path, &st) >= 0 ? (((u64)st.hisize << 32) | st.size) : 0;
+    ts_acc = 0;
+    dir_each(it->path, ts_cb, (void *)it->path);
+    return ts_acc;
+}
+static void unique_dest(const char *dir, const char *name, int is_dir, char *out, size_t n) {
+    char base[128], ext[32];
+    const char *dot = is_dir ? NULL : strrchr(name, '.');
+    path_join(out, n, dir, name);
+    if (!path_exists(out)) return;
+    snprintf(base, sizeof base, "%.*s", dot ? (int)(dot - name) : (int)strlen(name), name);
+    snprintf(ext, sizeof ext, "%s", dot ? dot : "");
+    for (int i = 1; i < 100; i++) {
+        char cand[200];
+        snprintf(cand, sizeof cand, "%s (%d)%s", base, i, ext);
+        path_join(out, n, dir, cand);
+        if (!path_exists(out)) return;
+    }
+}
+static void op_report(int done, int rc) {
+    char msg[96];
+    if (rc == 0) snprintf(msg, sizeof msg, "%s: %d", T(L_OPDONE), done);
+    else if (rc == -2) snprintf(msg, sizeof msg, "%s", T(L_CANCELLED));
+    else snprintf(msg, sizeof msg, "%s: %.40s", T(L_OPFAIL), op_err);
+    toast(msg);
+}
+static void fm_paste(void) {
+    int done = 0, rc = 0;
+    if (!nclip) return;
+    op_begin(clip_move ? T(L_MOVING) : T(L_COPYING));
+    iobuf = malloc(IOBUF);
+    if (!iobuf) { toast(T(L_OPFAIL)); return; }
+    op_total = op_done = 0;
+    snprintf(op_l1, sizeof op_l1, "...");
+    for (int i = 0; i < nclip; i++) op_total += item_size(&clip[i]);
+    op_cancel = 0;
+    for (int i = 0; i < nclip && !rc; i++) {
+        char dst[256], src_dir[256];
+        const Item *it = &clip[i];
+        size_t sl = strlen(it->path);
+        unique_dest(fpath, base_name(it->path), it->dir, dst, sizeof dst);
+        snprintf(src_dir, sizeof src_dir, "%s", it->path);
+        path_up(src_dir);
+        if (it->dir && !strncmp(dst, it->path, sl) && (dst[sl] == '/' || dst[sl] == 0)) {
+            snprintf(op_err, sizeof op_err, "%s", "into itself"); rc = -1; break;
+        }
+        if (clip_move && dev_unit(it->path) == dev_unit(fpath) && !strcmp(src_dir, fpath)) continue;   /* перенос в ту же папку */
+        if (clip_move && dev_unit(it->path) == dev_unit(fpath) && fileXioRename(it->path, dst) >= 0) { done++; continue; }
+        rc = copy_entry(it->path, dst, it->dir);
+        if (!rc && clip_move) rc = del_entry(it->path, it->dir);
+        if (!rc) done++;
+    }
+    free(iobuf); iobuf = NULL;
+    if (clip_move && !rc) nclip = 0;
+    op_report(done, rc);
+    list_dir();
+}
+static void fm_do_delete(void) {
+    int done = 0, rc = 0;
+    op_begin(T(L_DELETING));
+    for (int i = 0; i < ndel && !rc; i++) {
+        rc = del_entry(del_list[i].path, del_list[i].dir);
+        if (!rc) done++;
+    }
+    op_report(done, rc);
+    for (int i = 0; i < nfe; i++) fe[i].mark = 0;
+    list_dir();
+}
+static int fm_collect(Item *out, int max) {              /* отмеченные элементы, иначе текущий */
+    int n = 0;
+    for (int i = 0; i < nfe && n < max; i++)
+        if (fe[i].mark) { path_join(out[n].path, sizeof out[n].path, fpath, fe[i].name); out[n].dir = fe[i].dir; n++; }
+    if (!n && nfe > 0 && f_sel < nfe) { path_join(out[0].path, sizeof out[0].path, fpath, fe[f_sel].name); out[0].dir = fe[f_sel].dir; n = 1; }
+    return n;
+}
+static void fm_menu_open(void) {
+    nact = 0;
+    if (nfe) { acts[nact++] = A_COPY; acts[nact++] = A_CUT; }
+    if (nclip) acts[nact++] = A_PASTE;
+    if (nfe) acts[nact++] = A_DEL;
+    acts[nact++] = A_CANCEL;
+    fm_menu = 1; fm_cur = 0;
+}
+static void fm_run_action(int a) {
+    char msg[64];
+    fm_menu = 0;
+    switch (a) {
+    case A_COPY:
+    case A_CUT:
+        nclip = fm_collect(clip, MAXCLIP);
+        clip_move = (a == A_CUT);
+        for (int i = 0; i < nfe; i++) fe[i].mark = 0;
+        snprintf(msg, sizeof msg, T(L_COPIED), nclip);
+        toast(msg);
+        break;
+    case A_PASTE: fm_paste(); break;
+    case A_DEL:
+        ndel = fm_collect(del_list, MAXCLIP);
+        if (ndel) { fm_del_n = ndel; confirm = 4; }
+        break;
+    default: break;
+    }
+}
+
+/* --- ввод --- */
+static void apps_input(u32 pressed, int fL, int fR, int fU, int fD) {
+    if (!a_open) {
+        if (pressed & PAD_SQUARE) { devs_probe(); sfx(FX_TAB); }
+        if (!ndevs) return;
+        if (fL && a_tile > 0) { a_tile--; sfx(FX_MOVE); }
+        if (fR && a_tile < ndevs - 1) { a_tile++; sfx(FX_MOVE); }
+        if (pressed & PAD_CROSS) {
+            sfx(FX_SELECT);
+            if (a_scanned != a_tile) apps_scan(a_tile);
+            a_open = 1;
+        }
+        return;
+    }
+    if (napp) {
+        if (fU) { a_sel = (a_sel + napp - 1) % napp; sfx(FX_MOVE); }
+        if (fD) { a_sel = (a_sel + 1) % napp; sfx(FX_MOVE); }
+        if (fL) { a_sel = a_sel - LIST_ROWS < 0 ? 0 : a_sel - LIST_ROWS; sfx(FX_MOVE); }
+        if (fR) { a_sel = a_sel + LIST_ROWS >= napp ? napp - 1 : a_sel + LIST_ROWS; sfx(FX_MOVE); }
+        if (pressed & PAD_CROSS) { sfx(FX_SELECT); launch_elf(apps[a_sel].path); }
+    }
+    if (pressed & PAD_SQUARE) { apps_scan(a_tile); sfx(FX_TAB); }
+    if (pressed & PAD_CIRCLE) { a_open = 0; sfx(FX_BACK); }
+}
+static void files_input(u32 pressed, int fL, int fR, int fU, int fD) {
+    if (!f_open) {
+        if (pressed & PAD_SQUARE) { devs_probe(); sfx(FX_TAB); }
+        if (!ndevs) return;
+        if (fL && f_tile > 0) { f_tile--; sfx(FX_MOVE); }
+        if (fR && f_tile < ndevs - 1) { f_tile++; sfx(FX_MOVE); }
+        if (pressed & PAD_CROSS) {
+            sfx(FX_SELECT);
+            snprintf(fpath, sizeof fpath, "%s/", devs[f_tile].prefix);
+            f_sel = 0; f_open = 1; list_dir();
+        }
+        return;
+    }
+    if (fm_menu) {
+        if (fU) { fm_cur = (fm_cur + nact - 1) % nact; sfx(FX_MOVE); }
+        if (fD) { fm_cur = (fm_cur + 1) % nact; sfx(FX_MOVE); }
+        if (pressed & PAD_CROSS) { sfx(FX_SELECT); fm_run_action(acts[fm_cur]); }
+        if (pressed & (PAD_CIRCLE | PAD_TRIANGLE)) { fm_menu = 0; sfx(FX_BACK); }
+        return;
+    }
+    if (nfe) {
+        if (fU) { f_sel = (f_sel + nfe - 1) % nfe; sfx(FX_MOVE); }
+        if (fD) { f_sel = (f_sel + 1) % nfe; sfx(FX_MOVE); }
+        if (fL) { f_sel = f_sel - LIST_ROWS < 0 ? 0 : f_sel - LIST_ROWS; sfx(FX_MOVE); }
+        if (fR) { f_sel = f_sel + LIST_ROWS >= nfe ? nfe - 1 : f_sel + LIST_ROWS; sfx(FX_MOVE); }
+        if (pressed & PAD_SQUARE) { fe[f_sel].mark ^= 1; if (f_sel + 1 < nfe) f_sel++; sfx(FX_TAB); }
+        if (pressed & PAD_CROSS) {
+            sfx(FX_SELECT);
+            if (fe[f_sel].dir) {
+                char sub[256];
+                path_join(sub, sizeof sub, fpath, fe[f_sel].name);
+                snprintf(fpath, sizeof fpath, "%s", sub);
+                f_sel = 0; list_dir();
+            } else fm_menu_open();
+        }
+    }
+    if (pressed & PAD_TRIANGLE) { fm_menu_open(); sfx(FX_OPEN); }
+    if (pressed & PAD_CIRCLE) {
+        sfx(FX_BACK);
+        if (path_is_root(fpath)) f_open = 0;
+        else {
+            char leaving[128];
+            snprintf(leaving, sizeof leaving, "%s", base_name(fpath));
+            path_up(fpath);
+            f_sel = 0; list_dir();
+            for (int i = 0; i < nfe; i++) if (!strcmp(fe[i].name, leaving)) { f_sel = i; break; }
+        }
+    }
+}
+
+/* --- рисование --- */
+static void draw_dev_tiles(int sel, float a, int apps_mode) {
+    float tw = 220, th = 104, gap = 20, total = ndevs * tw + (ndevs - 1) * gap, x = (VW - total) * 0.5f, y = 118;
+    text(x, 74, 22, TXT(255, 255, 255, a), T(L_STORAGE));
+    if (!ndevs) { text_c(VW * 0.5f, 220, 17, TXT(255, 255, 255, 0.85f * a), T(L_NODEV)); return; }
+    for (int i = 0; i < ndevs; i++) {
+        float tx = x + i * (tw + gap);
+        int on = (i == sel);
+        char sub[48];
+        rr_fill(tx, y, tw, th, 14, on ? RGBA(0xE6, 0xEA, 0xF4, 0.95f * a) : RGBA(0x20, 0x26, 0x38, 0.9f * a));
+        u64 c1 = on ? TXT(0x14, 0x18, 0x28, a) : TXT(255, 255, 255, a);
+        u64 c2 = on ? TXT(0x40, 0x48, 0x60, a) : TXT(190, 195, 210, a);
+        text(tx + 20, y + 16, 22, c1, devs[i].name);
+        if (apps_mode) {
+            if (devs[i].napps >= 0) snprintf(sub, sizeof sub, T(L_APPSN), devs[i].napps); else snprintf(sub, sizeof sub, "%s", "ELF ...");
+        } else if (devs[i].unit == 0) snprintf(sub, sizeof sub, T(L_GAMESN), ngames);
+        else snprintf(sub, sizeof sub, "%s", devs[i].prefix);
+        text(tx + 20, y + 58, 17, c2, sub);
+    }
+}
+static void draw_scroll(float x, float y0, float rows_h, int vis, int n, int first, float a) {
+    if (n <= vis) return;
+    float th = (rows_h - 8) * vis / (float)n, ty = y0 + (rows_h - 8 - th) * first / (float)(n - vis);
+    fill_rect(x, ty, 3, th, RGBA(255, 255, 255, 0.45f * a));
+}
+static void draw_apps(float a) {
+    if (!a_open) { draw_dev_tiles(a_tile, a, 1); return; }
+    float lw = 640, lx = (VW - lw) * 0.5f, ly = 104, rh = 38;
+    int vis = napp < LIST_ROWS ? napp : LIST_ROWS, first = 0;
+    char hdr[96];
+    snprintf(hdr, sizeof hdr, "%s \xC2\xB7 %d", devs[a_tile].name, napp);
+    text(lx, 70, 22, TXT(255, 255, 255, a), T(L_APPS));
+    text_r(lx + lw, 74, 17, TXT(200, 200, 210, a), hdr);
+    if (!napp) { text_c(VW * 0.5f, 230, 17, TXT(255, 255, 255, 0.85f * a), T(L_NOAPPS)); return; }
+    if (napp > vis) { first = a_sel - vis / 2; if (first < 0) first = 0; if (first > napp - vis) first = napp - vis; }
+    for (int k = 0; k < vis; k++) {
+        int i = first + k;
+        float y = ly + k * rh;
+        char nm[96], nm0[96], dir[200], dd[96];
+        const char *b = base_name(apps[i].path);
+        size_t L = strlen(b);
+        snprintf(nm0, sizeof nm0, "%.*s", (int)(L > 4 ? L - 4 : L), b);
+        snprintf(dir, sizeof dir, "%s", apps[i].path);
+        path_up(dir);
+        fit_text(nm, sizeof nm, nm0, 22, 330);
+        fit_text(dd, sizeof dd, dir, 17, lw - 380);
+        if (i == a_sel) rr_fill(lx, y, lw, rh - 4, 10, RGBA(255, 255, 255, 0.17f * a));
+        float ta = (i == a_sel) ? 1.0f : 0.75f;
+        text(lx + 16, y + 3, 22, TXT(255, 255, 255, ta * a), nm);
+        text_r(lx + lw - 16, y + 8, 17, TXT(200, 205, 220, 0.8f * ta * a), dd);
+    }
+    draw_scroll(lx + lw + 8, ly, vis * rh, vis, napp, first, a);
+}
+static void draw_files(float a) {
+    if (!f_open) { draw_dev_tiles(f_tile, a, 0); return; }
+    float lw = 640, lx = (VW - lw) * 0.5f, ly = 104, rh = 38;
+    int vis = nfe < LIST_ROWS ? nfe : LIST_ROWS, first = 0, marks = 0;
+    char head[128], info[96];
+    fit_text(head, sizeof head, fpath, 17, lw);
+    text(lx, 72, 17, TXT(220, 224, 236, a), head);
+    for (int i = 0; i < nfe; i++) marks += fe[i].mark;
+    if (!nfe) text_c(VW * 0.5f, 230, 17, TXT(255, 255, 255, 0.85f * a), T(L_EMPTYDIR));
+    if (nfe > vis) { first = f_sel - vis / 2; if (first < 0) first = 0; if (first > nfe - vis) first = nfe - vis; }
+    for (int k = 0; k < vis; k++) {
+        int i = first + k;
+        float y = ly + k * rh;
+        char nm[128], sz[24];
+        if (i == f_sel) rr_fill(lx, y, lw, rh - 4, 10, RGBA(255, 255, 255, 0.17f * a));
+        float ta = (i == f_sel) ? 1.0f : 0.78f;
+        if (fe[i].mark) rr_fill(lx + 8, y + 12, 10, 10, 5, RGBA(255, 255, 255, 0.95f * a));
+        if (fe[i].dir) {
+            rr_fill(lx + 26, y + 9, 24, 17, 3, RGBA(255, 214, 102, 0.95f * a));
+            rr_fill(lx + 26, y + 5, 11, 7, 2, RGBA(255, 214, 102, 0.95f * a));
+        } else {
+            rr_fill(lx + 31, y + 5, 16, 22, 3, RGBA(205, 214, 235, 0.9f * a));
+            fill_rect(lx + 34, y + 12, 10, 2, RGBA(0x30, 0x38, 0x58, 0.7f * a));
+            fill_rect(lx + 34, y + 17, 10, 2, RGBA(0x30, 0x38, 0x58, 0.7f * a));
+        }
+        fit_text(nm, sizeof nm, fe[i].name, 22, lw - 190);
+        text(lx + 62, y + 3, 22, TXT(255, 255, 255, ta * a), nm);
+        if (!fe[i].dir) { fmt_size(fe[i].size, sz, sizeof sz); text_r(lx + lw - 16, y + 8, 17, TXT(200, 205, 220, 0.85f * ta * a), sz); }
+    }
+    draw_scroll(lx + lw + 8, ly, vis * rh, vis, nfe, first, a);
+    info[0] = 0;
+    if (marks) snprintf(info, sizeof info, T(L_MARKED), marks);
+    else if (nclip) snprintf(info, sizeof info, clip_move ? T(L_CLIPMOVE) : T(L_CLIPCOPY), nclip);
+    if (info[0]) text(lx, ly + LIST_ROWS * rh + 6, 17, TXT(255, 255, 255, 0.8f * a), info);
+    if (fm_menu) {
+        float mw = 320, mh = 66 + nact * 38, mx = (VW - mw) * 0.5f, my = 120;
+        gsKit_prim_sprite(gs, 0, 0, gs->Width, gs->Height, 4, RGBA(0, 0, 0, 0.5f));
+        rr_fill(mx, my, mw, mh, 16, RGBA(0x12, 0x16, 0x24, 1.0f));
+        text(mx + 24, my + 14, 22, TXT(255, 255, 255, 1), T(L_ACTIONS));
+        for (int k = 0; k < nact; k++) {
+            const char *lab = acts[k] == A_COPY ? T(L_COPY) : acts[k] == A_CUT ? T(L_CUT) : acts[k] == A_PASTE ? T(L_PASTE) : acts[k] == A_DEL ? T(L_DELETE) : T(L_CANCEL);
+            float yy = my + 58 + k * 38;
+            if (k == fm_cur) rr_fill(mx + 10, yy, mw - 20, 34, 10, RGBA(255, 255, 255, 0.17f));
+            text(mx + 28, yy + 3, 22, TXT(255, 255, 255, k == fm_cur ? 1.0f : 0.75f), lab);
+        }
+    }
+}
+static const char *tab_hint(int tab) {
+    if (tab == 0) return T(L_HINT_GAMES);
+    if (tab == 1) return a_open ? T(L_HINT_APPS) : T(L_HINT_DEVS);
+    return f_open ? T(L_HINT_FILES) : T(L_HINT_DEVS);
 }
 
 /* ---------- Заставка ---------- */
@@ -1465,6 +2127,9 @@ int main(int argc, char *argv[]) {
     qsort(games, ngames, sizeof(Game), cmp_game);
     scan_tracks();
     audio_init();
+    fe = malloc(sizeof(FEnt) * MAXF);
+    apps = malloc(sizeof(AppEnt) * MAXAPPS);
+    devs_probe();
 
     int sel = 0, idle = 0, bgFor = -1, lgoFor = -1, lap = 0;
     int tab = 0, src = 0, hold[4] = { 0, 0, 0, 0 }, pad_on[4] = { 0, 0, 0, 0 };
@@ -1500,7 +2165,7 @@ int main(int argc, char *argv[]) {
             if (pressed & PAD_CROSS) { sfx(FX_SELECT); trial_keep(); }
             if (pressed & PAD_CIRCLE) { sfx(FX_BACK); trial_revert(); }
         } else if (confirm) {
-            if (pressed & PAD_CROSS) { int c = confirm; confirm = 0; sfx(FX_SELECT); if (c == 1) do_exit(); else do_poweroff(); }
+            if (pressed & PAD_CROSS) { int c = confirm; confirm = 0; sfx(FX_SELECT); if (c == 1) do_exit(); else if (c == 2) do_poweroff(); else if (c == 4) fm_do_delete(); }
             if (pressed & PAD_CIRCLE) { confirm = 0; sfx(FX_BACK); }
         } else if (set_open) {
             int n = page_count(pg);
@@ -1544,8 +2209,10 @@ int main(int argc, char *argv[]) {
                     lgo_state = 0; anim_to(&bgA, 0);
                 }
                 if ((pressed & PAD_CROSS) && nvis > 0) { sfx(FX_SELECT); toast(T(L_LAUNCHSOON)); }
-            }
+            } else if (tab == 1) apps_input(pressed, fL, fR, fU, fD);
+            else files_input(pressed, fL, fR, fU, fD);
         }
+        if (g_resync) { prev = read_buttons(); g_resync = 0; for (int k = 0; k < 4; k++) hold[k] = 0; }
         idle++;
 
         /* --- анимации и состояние --- */
@@ -1718,12 +2385,11 @@ int main(int argc, char *argv[]) {
             }
         } else {
             float a = tabFade.v;
-            text_c(VW * 0.5f, 210, 22, TXT(255, 255, 255, a), tab == 1 ? T(L_APPS) : T(L_FILES));
-            text_c(VW * 0.5f, 250, 17, TXT(200, 200, 200, 0.85f * a), T(L_SOON_PAGE));
+            if (tab == 1) draw_apps(a); else draw_files(a);
         }
 
         if (!intro_on || intro_t < t_part() + 3.0f)
-            text_c(VW * 0.5f, VH - 36, 17, TXT(255, 255, 255, 0.6f * (1.0f - fminf(set_anim * 2.0f, 1.0f))), T(L_HINT_GAMES));
+            text_c(VW * 0.5f, VH - 36, 17, TXT(255, 255, 255, 0.6f * (1.0f - fminf(set_anim * 2.0f, 1.0f))), tab_hint(tab));
 
         if (set_anim > 0.01f) draw_settings(smooth01((set_anim - 0.35f) / 0.65f));
         if (confirm) draw_confirm();
