@@ -119,7 +119,7 @@ static float clampf(float v, float a, float b) { return v < a ? a : (v > b ? b :
 static float ease_out(float t) { t = 1.0f - clampf(t, 0, 1); return 1.0f - t * t * t; }
 static float smooth01(float t) { t = clampf(t, 0, 1); return t * t * (3.0f - 2.0f * t); }
 
-static int exists_file(const char *p) { FILE *f = fopen(p, "rb"); if (!f) return 0; fclose(f); return 1; }
+static int __attribute__((unused)) exists_file(const char *p) { FILE *f = fopen(p, "rb"); if (!f) return 0; fclose(f); return 1; }
 static int exists_dir(const char *p)  { DIR *d = opendir(p); if (!d) return 0; closedir(d); return 1; }
 
 /* ---------- IOP ---------- */
@@ -1488,7 +1488,7 @@ static int dev_unit(const char *p) {                      /* "mass:" -> 0, "mass
     if (p[4] >= '0' && p[4] <= '9' && p[5] == ':') return p[4] - '0';
     return -1;
 }
-static int path_exists(const char *p) { iox_stat_t st; return fileXioGetstat(p, &st) >= 0; }
+static int path_exists(const char *p) { iox_stat_t st; return fileXioGetStat(p, &st) >= 0; }
 
 typedef int (*DirCb)(const char *name, const iox_stat_t *st, void *ud);
 /* перебор каталога; обратный вызов вернул != 0 -> прервать (результат > 0); -1 = не открылся */
@@ -1751,7 +1751,7 @@ static int ts_cb(const char *name, const iox_stat_t *st, void *ud) {
 }
 static u64 item_size(const Item *it) {
     iox_stat_t st;
-    if (!it->dir) return fileXioGetstat(it->path, &st) >= 0 ? (((u64)st.hisize << 32) | st.size) : 0;
+    if (!it->dir) return fileXioGetStat(it->path, &st) >= 0 ? (((u64)st.hisize << 32) | st.size) : 0;
     ts_acc = 0;
     dir_each(it->path, ts_cb, (void *)it->path);
     return ts_acc;
