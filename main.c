@@ -92,10 +92,11 @@ typedef struct {
     int  clock24, volume, music_on, fx_on, music_vol, fx_vol;
     char track[64];
     int  vtry;                     /* видеорежим на пробу при следующем запуске, -1 = нет */
+    int  artspeed;                 /* сколько пикселей исходной картинки обрабатывать за кадр (меньше = плавнее) */
 } Config;
 /* video: 0 auto, 1 ntsc, 2 pal, 3 480p, 4 720p, 5 1080i */
 #define NVIDEO 6
-static Config cfg = { 0, 1, 0, 0, 0, 0, "", "", 1, 180, 1, 80, 1, 1, 100, 100, "", -1 };
+static Config cfg = { 0, 1, 0, 0, 0, 0, "", "", 1, 180, 1, 80, 1, 1, 100, 100, "", -1, 8000 };
 
 static GSGLOBAL *gs;
 static GSFONTM  *fontm;
@@ -244,6 +245,7 @@ static void cfg_set(const char *k, const char *v) {
     else if (!strcasecmp(k, "fxvol"))      cfg.fx_vol    = (int)clampf((float)atoi(v), 0, 100);
     else if (!strcasecmp(k, "effects"))    cfg.fx_on    = atoi(v) != 0;
     else if (!strcasecmp(k, "track"))      snprintf(cfg.track, sizeof cfg.track, "%s", v);
+    else if (!strcasecmp(k, "artspeed"))   cfg.artspeed  = (int)clampf((float)atoi(v), 1000, 100000);
 }
 static int parse_cfg(FILE *f) {
     char line[200];
@@ -294,6 +296,7 @@ static int save_cfg(void) {
     fprintf(f, "music=%d\nmusicvol=%d\nfxvol=%d\n", cfg.music_on, cfg.music_vol, cfg.fx_vol);
     fprintf(f, "effects=%d\n", cfg.fx_on);
     fprintf(f, "track=%s\n", cfg.track);
+    fprintf(f, "artspeed=%d\n", cfg.artspeed);
     fprintf(f, "debug=%d\n", cfg.debug);
     fprintf(f, "argv0=%d\ncwd=%d\nslash=%d\n", cfg.argv0, cfg.cwd, cfg.slash);
     fprintf(f, "extra=%s\nextra2=%s\n", cfg.extra, cfg.extra2);
@@ -673,6 +676,153 @@ static int load_png_ex(GSTEXTURE *t, const char *path, int maxw, int maxh, int s
     return 0;
 }
 
+/* ---------- Загрузка PNG по кусочкам: картинки подгружаются между кадрами и не вешают меню ---------- */
+typedef struct {
+    int active, w, h, passes, sy, cx, cy, cw, ch, dw, dh, dyDone;
+    float fx, fy;
+    FILE *fp;
+    png_structp png;
+    png_infop info;
+    unsigned char *row, *full;
+    png_bytep *frows;
+    float *H, *acc[2];
+    u32 *out;
+    GSTEXTURE *dst;
+} ALoad;
+
+static void aload_cancel(ALoad *a) {
+    if (a->png) png_destroy_read_struct(&a->png, &a->info, NULL);
+    if (a->fp) fclose(a->fp);
+    free(a->row); free(a->full); free(a->frows); free(a->H);
+    free(a->acc[0]); free(a->acc[1]); free(a->out);
+    memset(a, 0, sizeof *a);
+}
+/* 0 = загрузка началась, -1 = нет файла или не PNG */
+static int aload_start(ALoad *a, GSTEXTURE *dst, const char *path, int maxw, int maxh, int square) {
+    unsigned char sig[8];
+    png_uint_32 w, h;
+    int depth, ctype, cw, ch, cx = 0, cy = 0, dw, dh;
+    aload_cancel(a);
+    a->fp = fopen(path, "rb");
+    if (!a->fp) return -1;
+    if (fread(sig, 1, 8, a->fp) != 8 || png_sig_cmp(sig, 0, 8)) { aload_cancel(a); return -1; }
+    a->png = png_create_read_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+    a->info = a->png ? png_create_info_struct(a->png) : NULL;
+    if (!a->png || !a->info) { aload_cancel(a); return -1; }
+    if (setjmp(png_jmpbuf(a->png))) { aload_cancel(a); return -1; }
+    png_init_io(a->png, a->fp);
+    png_set_sig_bytes(a->png, 8);
+    png_read_info(a->png, a->info);
+    png_get_IHDR(a->png, a->info, &w, &h, &depth, &ctype, NULL, NULL, NULL);
+    if (!w || !h || (unsigned long)w * h > 2200000UL) png_error(a->png, "size");
+    if (depth == 16) png_set_strip_16(a->png);
+    if (ctype == PNG_COLOR_TYPE_PALETTE) png_set_palette_to_rgb(a->png);
+    if (ctype == PNG_COLOR_TYPE_GRAY && depth < 8) png_set_expand_gray_1_2_4_to_8(a->png);
+    if (png_get_valid(a->png, a->info, PNG_INFO_tRNS)) png_set_tRNS_to_alpha(a->png);
+    if (ctype == PNG_COLOR_TYPE_GRAY || ctype == PNG_COLOR_TYPE_GRAY_ALPHA) png_set_gray_to_rgb(a->png);
+    png_set_filler(a->png, 0xFF, PNG_FILLER_AFTER);
+    a->passes = png_set_interlace_handling(a->png);
+    png_read_update_info(a->png, a->info);
+    a->w = (int)w; a->h = (int)h;
+    cw = a->w; ch = a->h;
+    if (square) { cw = ch = (a->w < a->h) ? a->w : a->h; cx = (a->w - cw) / 2; cy = (a->h - ch) / 2; }
+    dw = cw; dh = ch;
+    if (maxw > 0 && (cw > maxw || ch > maxh)) {
+        float sc = fminf((float)maxw / cw, (float)maxh / ch);
+        dw = (int)(cw * sc + 0.5f); dh = (int)(ch * sc + 0.5f);
+        if (dw < 1) dw = 1;
+        if (dh < 1) dh = 1;
+    }
+    a->cx = cx; a->cy = cy; a->cw = cw; a->ch = ch; a->dw = dw; a->dh = dh;
+    a->fx = (float)cw / dw; a->fy = (float)ch / dh;
+    a->row = malloc((size_t)a->w * 4);
+    a->H = malloc(sizeof(float) * 5 * (size_t)dw);
+    a->acc[0] = calloc((size_t)dw * 5, sizeof(float));
+    a->acc[1] = calloc((size_t)dw * 5, sizeof(float));
+    a->out = memalign(128, (size_t)dw * dh * 4);
+    if (!a->row || !a->H || !a->acc[0] || !a->acc[1] || !a->out) png_error(a->png, "mem");
+    if (a->passes > 1) {                                  /* чересстрочный PNG: приходится прочитать целиком сразу */
+        a->full = malloc((size_t)a->w * a->h * 4);
+        a->frows = malloc(sizeof(png_bytep) * (size_t)a->h);
+        if (!a->full || !a->frows) png_error(a->png, "mem");
+        for (int i = 0; i < a->h; i++) a->frows[i] = a->full + (size_t)i * a->w * 4;
+        png_read_image(a->png, a->frows);
+    }
+    a->sy = 0; a->dyDone = 0; a->dst = dst; a->active = 1;
+    return 0;
+}
+static void aload_finish_row(ALoad *a, int dy) {
+    float *acc = a->acc[dy & 1];
+    u32 *o = a->out + (size_t)dy * a->dw;
+    for (int x = 0; x < a->dw; x++) {
+        float *p = acc + x * 5;
+        unsigned r = 0, g = 0, b = 0, a8 = 0;
+        if (p[4] > 0 && p[3] > 0) {
+            r = (unsigned)(p[0] / p[3] + 0.5f); g = (unsigned)(p[1] / p[3] + 0.5f); b = (unsigned)(p[2] / p[3] + 0.5f);
+            a8 = (unsigned)(p[3] / p[4] + 0.5f);
+        }
+        if (r > 255) r = 255;
+        if (g > 255) g = 255;
+        if (b > 255) b = 255;
+        if (a8 > 255) a8 = 255;
+        o[x] = ((a8 * 128u + 127u) / 255u << 24) | (b << 16) | (g << 8) | r;
+        p[0] = p[1] = p[2] = p[3] = p[4] = 0;
+    }
+}
+static void aload_row(ALoad *a, const unsigned char *src) {
+    int rel = a->sy - a->cy, dy0, dy1;
+    for (int x = 0; x < a->dw; x++) {
+        float xa = x * a->fx, xb = xa + a->fx, sr = 0, sg = 0, sb = 0, sa = 0, area = 0;
+        float *hp = a->H + x * 5;
+        for (int sx = (int)xa; sx < (int)ceilf(xb) && sx < a->cw; sx++) {
+            float wx = fminf((float)(sx + 1), xb) - fmaxf((float)sx, xa);
+            const unsigned char *p = src + (size_t)(a->cx + sx) * 4;
+            float al = p[3] * wx;
+            sr += p[0] * al; sg += p[1] * al; sb += p[2] * al; sa += al; area += wx;
+        }
+        hp[0] = sr; hp[1] = sg; hp[2] = sb; hp[3] = sa; hp[4] = area;
+    }
+    dy0 = (int)((float)rel / a->fy);
+    dy1 = (int)(((float)rel + 1.0f - 1e-4f) / a->fy);
+    if (dy1 >= a->dh) dy1 = a->dh - 1;
+    for (int dy = dy0; dy <= dy1; dy++) {
+        float lo = fmaxf((float)rel, dy * a->fy), hi = fminf((float)rel + 1.0f, (dy + 1) * a->fy), wy = hi - lo;
+        float *acc = a->acc[dy & 1];
+        if (wy <= 0) continue;
+        for (int i = 0; i < a->dw * 5; i++) acc[i] += a->H[i] * wy;
+    }
+    while (a->dyDone < a->dh && (a->dyDone + 1) * a->fy <= (float)rel + 1.0f + 1e-4f) aload_finish_row(a, a->dyDone++);
+}
+/* продвигает загрузку на budget исходных пикселей; 0 = идёт, 1 = готово (текстура записана в dst), -1 = ошибка */
+static int aload_step(ALoad *a, int budget) {
+    if (!a->active) return 0;
+    if (setjmp(png_jmpbuf(a->png))) { aload_cancel(a); return -1; }
+    while (budget > 0 && a->sy < a->cy + a->ch) {
+        const unsigned char *src;
+        if (a->full) src = a->full + (size_t)a->sy * a->w * 4;
+        else { png_read_row(a->png, a->row, NULL); src = a->row; }
+        if (a->sy >= a->cy) aload_row(a, src);
+        a->sy++;
+        budget -= a->w;
+    }
+    if (a->sy >= a->cy + a->ch) {
+        GSTEXTURE t;
+        while (a->dyDone < a->dh) aload_finish_row(a, a->dyDone++);
+        memset(&t, 0, sizeof t);
+        t.Width = a->dw; t.Height = a->dh;
+        t.PSM = GS_PSM_CT32;
+        t.Mem = a->out; t.Filter = GS_FILTER_LINEAR; t.Delayed = 1;
+        a->out = NULL;
+        free_tex(a->dst);
+        *a->dst = t;
+        aload_cancel(a);
+        return 1;
+    }
+    return 0;
+}
+static ALoad ld_bg, ld_lgo, ld_ico;
+static GSTEXTURE noicon_tex, bg_def;
+
 /* ---------- Шрифт: исходный лист 48 px -> атлас под текущий видеорежим ---------- */
 typedef struct { unsigned short x, y; unsigned char w, h; signed char ox, oy; } BGlyph;
 typedef struct { float h; GSTEXTURE tex; BGlyph g[FONT_NGLYPH]; } FontCls;
@@ -1046,20 +1196,29 @@ static int cmp_game(const void *a, const void *b) {
     return strcasecmp(((const Game *)a)->name, ((const Game *)b)->name);
 }
 /* Порядок поиска: _SQR (подготовленный квадрат) -> _COV (обложка) -> _ICO (диск) */
-static int load_art(Game *g) {
-    static const char *suf[] = { "SQR", "COV", "ICO" };
+static const char *const ICO_SUF[3] = { "SQR", "COV", "ICO" };
+static int ico_idx = -1, ico_suf;
+static int ico_start(int idx, int from) {
     char p[128];
-    if (!g->id[0]) return -1;
-    for (int k = 0; k < 3; k++) {
-        snprintf(p, sizeof p, ROOT "ART/%s_%s.png", g->id, suf[k]);
-        if (load_png_ex(&g->icon, p, 72, 72, 1) == 0) {
-            g->u0 = 0; g->v0 = 0; g->u1 = (float)g->icon.Width; g->v1 = (float)g->icon.Height;
-            return 0;
-        }
+    for (int k = from; k < 3; k++) {
+        snprintf(p, sizeof p, ROOT "ART/%s_%s.png", games[idx].id, ICO_SUF[k]);
+        if (aload_start(&ld_ico, &games[idx].icon, p, 72, 72, 1) == 0) { ico_idx = idx; ico_suf = k; return 1; }
     }
-    return -1;
+    return 0;
 }
-static void stream_icons(int sel) {
+/* icon_state: 0 = не грузили, 1 = готова, 2 = грузится, -1 = обложки нет */
+static void stream_icons(int sel, int budget) {
+    if (ld_ico.active) {
+        int r = aload_step(&ld_ico, budget);
+        if (r == 1) {
+            Game *g = &games[ico_idx];
+            g->u0 = 0; g->v0 = 0; g->u1 = (float)g->icon.Width; g->v1 = (float)g->icon.Height;
+            g->icon_state = 1; ico_idx = -1;
+        } else if (r < 0 && !ico_start(ico_idx, ico_suf + 1)) {
+            games[ico_idx].icon_state = -1; ico_idx = -1;
+        }
+        return;
+    }
     for (int i = 0; i < ngames; i++) {
         int d = abs(i - sel);
         if (d > ngames / 2) d = ngames - d;                 /* расстояние по кругу */
@@ -1069,7 +1228,8 @@ static void stream_icons(int sel) {
     for (unsigned k = 0; k < sizeof order / sizeof *order; k++) {
         int i = ((sel + order[k]) % ngames + ngames) % ngames;
         if (games[i].icon_state) continue;
-        games[i].icon_state = (load_art(&games[i]) == 0) ? 1 : -1;
+        if (!games[i].id[0]) { games[i].icon_state = -1; continue; }
+        games[i].icon_state = ico_start(i, 0) ? 2 : -1;
         return;
     }
 }
@@ -1116,7 +1276,7 @@ enum {
     L_KEEPVIDEO, L_REVERTIN, L_NOAUDIO, L_MUSICVOL, L_FXVOL,
     L_STORAGE, L_NODEV, L_GAMESN, L_APPSN, L_NOAPPS, L_SCANNING, L_FOUND, L_EMPTYDIR, L_ACTIONS, L_COPY, L_CUT, L_PASTE, L_DELETE,
     L_CANCEL, L_ASKDEL, L_CLIPCOPY, L_CLIPMOVE, L_OPDONE, L_OPFAIL, L_CANCELLED, L_COPYING, L_MOVING, L_DELETING, L_ELFFAIL,
-    L_HINT_DEVS, L_HINT_APPS, L_HINT_FILES, L_HINT_CANCEL, L_INTOSELF, L_COPIED, L_MARKED, L_COUNT
+    L_HINT_DEVS, L_HINT_APPS, L_HINT_FILES, L_HINT_CANCEL, L_INTOSELF, L_COPIED, L_MARKED, L_CLEAR, L_COUNT
 };
 static const char *const tr_tab[L_COUNT][2] = {
     [L_GAMES]       = { "Games", "Игры" },
@@ -1200,6 +1360,7 @@ static const char *const tr_tab[L_COUNT][2] = {
     [L_INTOSELF]    = { "Cannot paste a folder into itself", "Нельзя вставить папку саму в себя" },
     [L_COPIED]      = { "Items in clipboard: %d", "Элементов в буфере: %d" },
     [L_MARKED]      = { "Marked: %d", "Отмечено: %d" },
+    [L_CLEAR]       = { "Clear clipboard and marks", "Сбросить буфер и отметки" },
     [L_NOAUDIO]     = { "Audio is not available", "Звук недоступен" },
     [L_REVERTIN]    = { "Reverting in %d s if no answer", "Автоотмена через %d с, если не ответить" },
 };
@@ -1455,8 +1616,8 @@ static int     f_tile, f_open, f_sel;
 static char    fpath[256];
 static Item    clip[MAXCLIP], del_list[MAXCLIP];
 static int     nclip, clip_move, ndel, fm_menu, fm_cur;
-static int     acts[5], nact;
-enum { A_COPY, A_CUT, A_PASTE, A_DEL, A_CANCEL };
+static int     acts[6], nact;
+enum { A_COPY, A_CUT, A_PASTE, A_DEL, A_CLEAR, A_CANCEL };
 
 /* --- пути и размеры --- */
 static void path_join(char *dst, size_t n, const char *dir, const char *name) {
@@ -1831,6 +1992,11 @@ static void fm_menu_open(void) {
     if (nfe) { acts[nact++] = A_COPY; acts[nact++] = A_CUT; }
     if (nclip) acts[nact++] = A_PASTE;
     if (nfe) acts[nact++] = A_DEL;
+    {
+        int marks = 0;
+        for (int i = 0; i < nfe; i++) marks += fe[i].mark;
+        if (nclip || marks) acts[nact++] = A_CLEAR;
+    }
     acts[nact++] = A_CANCEL;
     fm_menu = 1; fm_cur = 0;
 }
@@ -1847,6 +2013,11 @@ static void fm_run_action(int a) {
         toast(msg);
         break;
     case A_PASTE: fm_paste(); break;
+    case A_CLEAR:
+        nclip = 0;
+        for (int i = 0; i < nfe; i++) fe[i].mark = 0;
+        toast(T(L_OPDONE));
+        break;
     case A_DEL:
         ndel = fm_collect(del_list, MAXCLIP);
         if (ndel) { fm_del_n = ndel; confirm = 4; }
@@ -2017,12 +2188,12 @@ static void draw_files(float a) {
     else if (nclip) snprintf(info, sizeof info, clip_move ? T(L_CLIPMOVE) : T(L_CLIPCOPY), nclip);
     if (info[0]) text(lx, ly + LIST_ROWS * rh + 6, 17, TXT(255, 255, 255, 0.8f * a), info);
     if (fm_menu) {
-        float mw = 320, mh = 66 + nact * 38, mx = (VW - mw) * 0.5f, my = 120;
+        float mw = 390, mh = 66 + nact * 38, mx = (VW - mw) * 0.5f, my = 120;
         gsKit_prim_sprite(gs, 0, 0, gs->Width, gs->Height, 4, RGBA(0, 0, 0, 0.5f));
         rr_fill(mx, my, mw, mh, 16, RGBA(0x12, 0x16, 0x24, 1.0f));
         text(mx + 24, my + 14, 22, TXT(255, 255, 255, 1), T(L_ACTIONS));
         for (int k = 0; k < nact; k++) {
-            const char *lab = acts[k] == A_COPY ? T(L_COPY) : acts[k] == A_CUT ? T(L_CUT) : acts[k] == A_PASTE ? T(L_PASTE) : acts[k] == A_DEL ? T(L_DELETE) : T(L_CANCEL);
+            const char *lab = acts[k] == A_COPY ? T(L_COPY) : acts[k] == A_CUT ? T(L_CUT) : acts[k] == A_PASTE ? T(L_PASTE) : acts[k] == A_DEL ? T(L_DELETE) : acts[k] == A_CLEAR ? T(L_CLEAR) : T(L_CANCEL);
             float yy = my + 58 + k * 38;
             if (k == fm_cur) rr_fill(mx + 10, yy, mw - 20, 34, 10, RGBA(255, 255, 255, 0.17f));
             text(mx + 28, yy + 3, 22, TXT(255, 255, 255, k == fm_cur ? 1.0f : 0.75f), lab);
@@ -2130,8 +2301,15 @@ int main(int argc, char *argv[]) {
     fe = malloc(sizeof(FEnt) * MAXF);
     apps = malloc(sizeof(AppEnt) * MAXAPPS);
     devs_probe();
+    {
+        char p[160];
+        img_path(p, sizeof p, "noicon.png");
+        load_png_ex(&noicon_tex, p, 72, 72, 1);
+        img_path(p, sizeof p, "bg.png");
+        load_png_ex(&bg_def, p, 448, 252, 0);
+    }
 
-    int sel = 0, idle = 0, bgFor = -1, lgoFor = -1, lap = 0;
+    int sel = 0, idle = 0, bgFor = -1, lgoFor = -1, lap = 0, bgKind = 0, lgoKind = 0, bg_state = 0, bg_start = 0, lgo_start = 0;
     int tab = 0, src = 0, hold[4] = { 0, 0, 0, 0 }, pad_on[4] = { 0, 0, 0, 0 };
     u32 prev = 0xFFFF;
     unsigned frame = 0;
@@ -2198,7 +2376,8 @@ int main(int argc, char *argv[]) {
                     sfx(FX_MOVE);
                     titleA.v = 0; anim_to(&titleA, 1);
                     titleY.v = 8; anim_to(&titleY, 0);
-                    lgo_state = 0;
+                    aload_cancel(&ld_bg); aload_cancel(&ld_lgo);
+                    lgo_state = 0; bg_state = 0;
                     anim_to(&bgA, 0);
                 }
                 int ds = fD ? 1 : fU ? -1 : 0;
@@ -2206,7 +2385,8 @@ int main(int argc, char *argv[]) {
                     src = (src + ds + 5) % 5;
                     sfx(FX_MOVE);
                     sel = 0; lap = 0; idle = 0; cam.v = cam.t = 0;
-                    lgo_state = 0; anim_to(&bgA, 0);
+                    aload_cancel(&ld_bg); aload_cancel(&ld_lgo);
+                    lgo_state = 0; bg_state = 0; anim_to(&bgA, 0);
                 }
                 if ((pressed & PAD_CROSS) && nvis > 0) { sfx(FX_SELECT); toast(T(L_LAUNCHSOON)); }
             } else if (tab == 1) apps_input(pressed, fL, fR, fU, fD);
@@ -2254,36 +2434,53 @@ int main(int argc, char *argv[]) {
         anim_step(&titleY, dt);
         anim_step(&bgA, dt);
 
-        /* --- подгрузка --- */
-        if (!nvis2) anim_to(&bgA, 0);
-        if (nvis2 && idle == 12) {
-            if (bgFor != sel) {
-                free_tex(&bg);
-                if (games[sel].id[0]) {
-                    char p[96];
-                    snprintf(p, sizeof p, ROOT "ART/%s_BG.png", games[sel].id);
-                    load_png_ex(&bg, p, 448, 252, 0);
-                }
-                bgFor = sel;
-            }
-            anim_to(&bgA, 1);
-        } else if (nvis2 && idle == 14 && lgoFor != sel) {
-            free_tex(&lgo_tex);
-            lgo_state = 0;
-            if (games[sel].id[0]) {
+        /* --- подгрузка: по кусочкам между кадрами, меню не зависает --- */
+        if (!nvis2) {
+            anim_to(&bgA, 0);
+            aload_cancel(&ld_bg); aload_cancel(&ld_lgo);
+            bg_state = 0; lgo_state = 0;
+        } else {
+            int nl, share;
+            if (idle >= 12 && bg_state == 0) {
                 char p[96];
-                snprintf(p, sizeof p, ROOT "ART/%s_LGO.png", games[sel].id);
-                if (load_png_ex(&lgo_tex, p, 256, 128, 0) == 0) lgo_state = 1;
+                if (bgFor == sel && bgKind) { bg_state = bgKind; anim_to(&bgA, 1); }
+                else {
+                    bg_start = sel;
+                    p[0] = 0;
+                    if (games[sel].id[0]) snprintf(p, sizeof p, ROOT "ART/%s_BG.png", games[sel].id);
+                    if (p[0] && aload_start(&ld_bg, &bg, p, 448, 252, 0) == 0) bg_state = 2;
+                    else { bgFor = sel; bgKind = bg_state = 3; anim_to(&bgA, 1); }
+                }
             }
-            lgoFor = sel;
-        } else if (nvis2 && idle > 2) {
-            stream_icons(sel);
+            if (idle >= 14 && lgo_state == 0) {
+                char p[96];
+                if (lgoFor == sel && lgoKind) lgo_state = lgoKind;
+                else {
+                    lgo_start = sel;
+                    p[0] = 0;
+                    if (games[sel].id[0]) snprintf(p, sizeof p, ROOT "ART/%s_LGO.png", games[sel].id);
+                    if (p[0] && aload_start(&ld_lgo, &lgo_tex, p, 256, 128, 0) == 0) lgo_state = 2;
+                    else { lgoFor = sel; lgoKind = lgo_state = 3; }
+                }
+            }
+            nl = (ld_bg.active ? 1 : 0) + (ld_lgo.active ? 1 : 0) + 1;
+            share = cfg.artspeed / nl;
+            if (ld_bg.active) {
+                int r = aload_step(&ld_bg, share);
+                if (r) { bgFor = bg_start; bgKind = bg_state = (r > 0) ? 1 : 3; anim_to(&bgA, 1); }
+            }
+            if (ld_lgo.active) {
+                int r = aload_step(&ld_lgo, share);
+                if (r) { lgoFor = lgo_start; lgoKind = lgo_state = (r > 0) ? 1 : 3; }
+            }
+            if (idle > 2) stream_icons(sel, share);
         }
 
         /* --- отрисовка --- */
         float W = gs->Width, H = gs->Height;
         gsKit_clear(gs, RGBA(0x08, 0x0C, 0x18, 1));
-        draw_full(&bg, bgA.v);
+        if (bg_state == 1) draw_full(&bg, bgA.v);
+        else if (bg_state == 3 || !nvis2) draw_full(&bg_def, nvis2 ? bgA.v : 1.0f);
 
         u64 dark = RGBA(0, 0, 0, 0.7f), none = RGBA(0, 0, 0, 0);
         gsKit_prim_quad_gouraud(gs, 0, 0, 0, H, X(VW * 0.6f), 0, X(VW * 0.6f), H, 1,
@@ -2344,10 +2541,14 @@ int main(int argc, char *argv[]) {
                     }
                     if (g->icon_state == 1) {
                         rr_tex(&g->icon, tx, ROW_Y, s, s, r, g->u0, g->v0, g->u1, g->v1, 1.0f);
+                    } else if (g->icon_state == -1 && noicon_tex.Mem) {
+                        rr_tex(&noicon_tex, tx, ROW_Y, s, s, r, 0, 0, (float)noicon_tex.Width, (float)noicon_tex.Height, 1.0f);
                     } else {
                         rr_fill(tx, ROW_Y, s, s, r, RGBA(0x2A, 0x2E, 0x3A, 0.92f));
-                        char ch[2] = { g->name[0] >= 32 && g->name[0] < 127 ? g->name[0] : '?', 0 };
-                        text_c(tx + s * 0.5f, ROW_Y + s * 0.2f, s * 0.5f, TXT(255, 255, 255, 0.7f), ch);
+                        if (g->icon_state == -1) {
+                            char ch[2] = { g->name[0] >= 32 && g->name[0] < 127 ? g->name[0] : '?', 0 };
+                            text_c(tx + s * 0.5f, ROW_Y + s * 0.2f, s * 0.5f, TXT(255, 255, 255, 0.7f), ch);
+                        }
                     }
                 }
 
@@ -2358,12 +2559,12 @@ int main(int argc, char *argv[]) {
                 fit_text(nm, sizeof nm, g->name, 17, 330);
                 text(sx + 12, ROW_Y + TILE_S + 10 + titleY.v, 17, TXT(255, 255, 255, titleA.v), nm);
 
-                if (lgo_state == 1 && lgoFor == sel) {                  /* логотип игры: внизу слева */
+                if (lgo_state == 1) {                                   /* логотип игры: внизу слева */
                     float bw = 330, bh = 140;
                     float sc = fminf(bw / lgo_tex.Width, bh / lgo_tex.Height);
                     float w = lgo_tex.Width * sc, h = lgo_tex.Height * sc;
                     draw_tex_box(&lgo_tex, 56, 388 - h + titleY.v, w, h, titleA.v);
-                } else {
+                } else if (lgo_state == 3 || !g->id[0]) {                  /* логотипа нет: показать название */
                     char big[96];
                     fit_text(big, sizeof big, g->name, 22, 520);
                     text(56, 350 + titleY.v, 22, TXT(255, 255, 255, titleA.v), big);
