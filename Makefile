@@ -5,7 +5,7 @@ EE_OBJS = main.o $(IRX_C:.c=.o)
 EE_INCS    += -I$(GSKIT)/include -I$(PS2SDK)/ports/include
 EE_LDFLAGS += -L$(GSKIT)/lib -L$(PS2SDK)/ports/lib
 EE_LIBS    += -lgskit_toolkit -lgskit -ldmakit -lpng -lz -lpad -lpatches \
-              -lelf-loader -lfileXio -lcdvd -lpoweroff -laudsrv -lm
+              -lelf-loader -lfileXio -lcdvd -lpoweroff -laudsrv -lmc -lm
 
 all: $(EE_BIN)
 
