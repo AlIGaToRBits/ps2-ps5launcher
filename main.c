@@ -1732,6 +1732,7 @@ static int mc_wait(void) { int cmd = 0, res = -1; mcSync(0, &cmd, &res); return 
 /* список каталога карты памяти; возвращает число записей или -1; память освобождает вызывающий */
 static int mc_dir_entries(int port, const char *dir, McEnt **out) {
     sceMcTblGetDir *t = memalign(64, sizeof(sceMcTblGetDir) * MCMAX);
+    McEnt *list = NULL;
     int total = 0, cap = 0, mode = 0, n, guard = 0;
     char pat[320];
     size_t L = strlen(dir);
