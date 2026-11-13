@@ -122,7 +122,7 @@ typedef struct {
     int  artspeed;                 /* сколько пикселей исходной картинки обрабатывать за кадр (меньше = плавнее) */
 } Config;
 /* video: 0 auto, 1 ntsc, 2 pal, 3 480p, 4 720p, 5 1080i */
-#define NVIDEO 7
+#define NVIDEO 6
 static Config cfg = { 0, 1, 0, 0, 0, 0, "", "", 1, 180, 1, 80, 1, 1, 100, 100, "", -1, 8000 };
 
 static GSGLOBAL *gs;
@@ -248,8 +248,9 @@ static char *trim(char *s) {
     while (e > s && (e[-1] == ' ' || e[-1] == '\t' || e[-1] == '\r' || e[-1] == '\n')) *--e = 0;
     return s;
 }
-static const char *const VID_KEY[NVIDEO] = { "auto", "ntsc", "pal", "480p", "720p", "1080i", "1080ih" };
+static const char *const VID_KEY[NVIDEO] = { "auto", "ntsc", "pal", "480p", "720p", "1080i" };
 static int parse_video(const char *v) {
+    if (!strcasecmp(v, "1080ih")) return 5;                 /* старое значение: HIRES убран, берём обычный 1080i */
     for (int i = 0; i < NVIDEO; i++) if (!strcasecmp(v, VID_KEY[i])) return i;
     return 0;
 }
@@ -951,7 +952,7 @@ static int font_build_all(const char *path) {
     unsigned char *src = png_decode(path, &w, &h);
     if (!src) return 0;
     if (w == FONT_SRC_W && h == FONT_SRC_H)
-        ok = bake_class(&fcls[0], src, 17.0f) && bake_class(&fcls[1], src, 22.0f);
+        ok = bake_class(&fcls[1], src, 22.0f);                /* один размер: экономит видеопамять; мелкий текст масштабируется */
     free(src);
     return ok;
 }
@@ -970,13 +971,11 @@ static void gfx_init(void) {
             gs->Field = GS_FRAME; gs->Width = 640; gs->Height = 360; break;
     case 5: gs->Mode = GS_MODE_DTV_1080I; gs->Interlace = GS_INTERLACED;         /* 960x540, растягивается в 2x2 */
             gs->Field = GS_FIELD; gs->Width = 960; gs->Height = 540; gs->PSM = GS_PSM_CT16; break;
-    case 6: gs->Mode = GS_MODE_DTV_1080I; gs->Interlace = GS_INTERLACED;         /* HIRES: 1920x540, один буфер (нет места на два) */
-            gs->Field = GS_FIELD; gs->Width = 1920; gs->Height = 540; gs->PSM = GS_PSM_CT16; break;
     default: break;
     }
     gs->ZBuffering = GS_SETTING_OFF;
     gs->PrimAlphaEnable = GS_SETTING_ON;
-    gs->DoubleBuffering = (run_video == 6) ? GS_SETTING_OFF : GS_SETTING_ON;
+    gs->DoubleBuffering = GS_SETTING_ON;
 #if HAVE_DITHER
     gs->Dithering = GS_SETTING_ON;                    /* сглаживание цвета: убирает ступеньки в 16-битных режимах */
 #endif
@@ -1057,7 +1056,7 @@ static float text(float x, float y, float h, u64 col, const char *s) {
         gsKit_fontm_print_scaled(gs, fontm, X(x), Y(y), 3, h / 48.0f * ky, col, buf);
         return text_w(h, buf);
     }
-    FontCls *fc = (h < 19.5f) ? &fcls[0] : &fcls[1];
+    FontCls *fc = &fcls[1];
     float sc = h / fc->h, k = h / FONT_SRC_EM / 16.0f, pen = x;
     float oy = floorf(Y(y) + 0.5f);
     const unsigned char *p = (const unsigned char *)s;
@@ -1216,6 +1215,22 @@ static void draw_pad_slot(float x, float y, int on) {
     else draw_pad_icon(x + 2, y + 3, on);
 }
 
+/* затемнение, плавно сходящее на нет тремя отрезками: край почти не виден даже в 16-битном режиме */
+static void grad_x(float x0, float x1, float a0) {
+    float xs[4] = { x0, x0 + (x1 - x0) * 0.35f, x0 + (x1 - x0) * 0.7f, x1 };
+    float as[4] = { a0, a0 * 0.45f, a0 * 0.14f, 0.0f };
+    for (int i = 0; i < 3; i++)
+        gsKit_prim_quad_gouraud(gs, X(xs[i]), 0, X(xs[i]), (float)gs->Height, X(xs[i + 1]), 0, X(xs[i + 1]), (float)gs->Height, 1,
+                                RGBA(0, 0, 0, as[i]), RGBA(0, 0, 0, as[i]), RGBA(0, 0, 0, as[i + 1]), RGBA(0, 0, 0, as[i + 1]));
+}
+static void grad_y(float y0, float y1, float a0) {
+    float ys[4] = { y0, y0 + (y1 - y0) * 0.35f, y0 + (y1 - y0) * 0.7f, y1 };
+    float as[4] = { a0, a0 * 0.45f, a0 * 0.14f, 0.0f };
+    for (int i = 0; i < 3; i++)
+        gsKit_prim_quad_gouraud(gs, 0, Y(ys[i]), (float)gs->Width, Y(ys[i]), 0, Y(ys[i + 1]), (float)gs->Width, Y(ys[i + 1]), 1,
+                                RGBA(0, 0, 0, as[i]), RGBA(0, 0, 0, as[i]), RGBA(0, 0, 0, as[i + 1]), RGBA(0, 0, 0, as[i + 1]));
+}
+
 /* ---------- Игры ---------- */
 static void scan_dir(const char *sub, int is_cd) {
     char path[64];
@@ -1251,7 +1266,7 @@ static int ico_start(int idx, int from) {
     char p[128];
     for (int k = from; k < 3; k++) {
         snprintf(p, sizeof p, ROOT "ART/%s_%s.png", games[idx].id, ICO_SUF[k]);
-        if (aload_start(&ld_ico, &games[idx].icon, p, 72, 72, 1) == 0) { ico_idx = idx; ico_suf = k; return 1; }
+        if (aload_start(&ld_ico, &games[idx].icon, p, 64, 64, 1) == 0) { ico_idx = idx; ico_suf = k; return 1; }
     }
     return 0;
 }
@@ -1409,7 +1424,7 @@ static const char *const tr_tab[L_COUNT][2] = {
     [L_INTOSELF]    = { "Cannot paste a folder into itself", "Нельзя вставить папку саму в себя" },
     [L_COPIED]      = { "Items in clipboard: %d", "Элементов в буфере: %d" },
     [L_MARKED]      = { "Marked: %d", "Отмечено: %d" },
-    [L_FREEKB]      = { "Free: %d KB", "Свободно: %d КБ" },
+    [L_FREEKB]      = { "Free: %s", "Свободно: %s" },
     [L_CLEAR]       = { "Clear clipboard and marks", "Сбросить буфер и отметки" },
     [L_NOAUDIO]     = { "Audio is not available", "Звук недоступен" },
     [L_REVERTIN]    = { "Reverting in %d s if no answer", "Автоотмена через %d с, если не ответить" },
@@ -1480,7 +1495,7 @@ static const char *item_label(int p, int i) {
 }
 /* значение справа; пустая строка = у пункта нет значения */
 static void item_value(int p, int i, char *out, size_t n) {
-    static const char *vid[NVIDEO] = { "Auto", "NTSC", "PAL", "480p", "720p", "1080i", "1080i HIRES" };
+    static const char *vid[NVIDEO] = { "Auto", "NTSC", "PAL", "480p", "720p", "1080i" };
     out[0] = 0;
     if (p == PG_SCREEN) {
         char tz[24];
@@ -1651,7 +1666,7 @@ static void draw_confirm(void) {
 #define IOBUF    (64 * 1024)
 #define LIST_ROWS 8
 
-typedef struct { char prefix[12]; char name[16]; int unit, napps, kind, free_kb; } Dev;
+typedef struct { char prefix[12]; char name[16]; int unit, napps, kind, free_kb, total_kb; } Dev;
 typedef struct { char name[120]; u64 size; unsigned char dir, mark; } FEnt;
 typedef struct { char path[200]; } AppEnt;
 typedef struct { char path[256]; int dir; } Item;
@@ -1923,7 +1938,7 @@ static void devs_probe(void) {
         Dev *d = &devs[ndevs++];
         snprintf(d->prefix, sizeof d->prefix, "%s", p);
         snprintf(d->name, sizeof d->name, "USB %d", u + 1);
-        d->unit = u; d->napps = -1; d->kind = 0; d->free_kb = 0;
+        d->unit = u; d->napps = -1; d->kind = 0; d->free_kb = 0; d->total_kb = 0;
     }
 #if HAVE_MC
     if (mc_ok)
@@ -1935,6 +1950,8 @@ static void devs_probe(void) {
             snprintf(d->prefix, sizeof d->prefix, "mc%d:", p);
             snprintf(d->name, sizeof d->name, "Memory Card %d", p + 1);
             d->unit = 10 + p; d->napps = -1; d->kind = 1; d->free_kb = fr;
+            d->total_kb = 8192;                         /* стандартная карта 8 МБ; бывают и больше */
+            while (d->total_kb < fr) d->total_kb *= 2;
         }
 #endif
     if (a_tile >= ndevs) a_tile = 0;
@@ -2385,10 +2402,19 @@ static void draw_dev_tiles(int sel, float a, int apps_mode) {
         text(tx + 16, y + 16, 22, c1, nm);
         if (apps_mode) {
             if (devs[i].napps >= 0) snprintf(sub, sizeof sub, T(L_APPSN), devs[i].napps); else snprintf(sub, sizeof sub, "%s", "ELF ...");
-        } else if (devs[i].kind == 1) snprintf(sub, sizeof sub, T(L_FREEKB), devs[i].free_kb);
+        } else if (devs[i].kind == 1) {
+            char fsz[24];
+            fmt_size((u64)devs[i].free_kb * 1024ULL, fsz, sizeof fsz);
+            snprintf(sub, sizeof sub, T(L_FREEKB), fsz);
+        }
         else if (devs[i].unit == 0) snprintf(sub, sizeof sub, T(L_GAMESN), ngames);
         else snprintf(sub, sizeof sub, "%s", devs[i].prefix);
-        text(tx + 16, y + 58, 17, c2, sub);
+        text(tx + 16, y + 52, 17, c2, sub);
+        if (devs[i].total_kb > 0) {                       /* полоска: занято / всего */
+            float bw = tw - 32, used = 1.0f - (float)devs[i].free_kb / (float)devs[i].total_kb;
+            rr_fill(tx + 16, y + th - 22, bw, 8, 4, on ? RGBA(0x20, 0x28, 0x48, 0.25f * a) : RGBA(255, 255, 255, 0.22f * a));
+            if (used > 0.01f) rr_fill(tx + 16, y + th - 22, fmaxf(8.0f, bw * clampf(used, 0, 1)), 8, 4, on ? RGBA(0x14, 0x18, 0x28, 0.9f * a) : RGBA(255, 255, 255, 0.85f * a));
+        }
     }
 }
 static void draw_scroll(float x, float y0, float rows_h, int vis, int n, int first, float a) {
@@ -2577,9 +2603,9 @@ int main(int argc, char *argv[]) {
     {
         char p[160];
         img_path(p, sizeof p, "noicon.png");
-        load_png_ex(&noicon_tex, p, 72, 72, 1);
+        load_png_ex(&noicon_tex, p, 64, 64, 1);
         img_path(p, sizeof p, "bg.png");
-        load_png_ex(&bg_def, p, 320, 180, 0);
+        load_png_ex(&bg_def, p, 256, 144, 0);
         img_path(p, sizeof p, "GamePadON.png");
         load_png_ex(&pad_on_tex, p, 64, 64, 0);
         img_path(p, sizeof p, "GamePadOFF.png");
@@ -2727,7 +2753,7 @@ int main(int argc, char *argv[]) {
                     bg_start = sel;
                     p[0] = 0;
                     if (games[sel].id[0]) snprintf(p, sizeof p, ROOT "ART/%s_BG.png", games[sel].id);
-                    if (p[0] && aload_start(&ld_bg, &bg, p, 400, 225, 0) == 0) bg_state = 2;
+                    if (p[0] && aload_start(&ld_bg, &bg, p, 384, 216, 0) == 0) bg_state = 2;
                     else { bgFor = sel; bgKind = bg_state = 3; anim_to(&bgA, 1); }
                 }
             }
@@ -2756,18 +2782,13 @@ int main(int argc, char *argv[]) {
         }
 
         /* --- отрисовка --- */
-        float W = gs->Width, H = gs->Height;
         gsKit_clear(gs, RGBA(0x08, 0x0C, 0x18, 1));
         if (!(bg_state == 1 && bgA.v >= 0.995f)) draw_full(&bg_def, 1.0f);      /* общий фон лаунчера */
         if (bg_state == 1) draw_full(&bg, bgA.v);                                /* фон игры плавно поверх */
 
-        u64 dark = RGBA(0, 0, 0, 0.7f), none = RGBA(0, 0, 0, 0);
-        gsKit_prim_quad_gouraud(gs, 0, 0, 0, H, X(VW * 0.6f), 0, X(VW * 0.6f), H, 1,
-                                dark, dark, none, none);
-        gsKit_prim_quad_gouraud(gs, 0, H, W, H, 0, Y(250), W, Y(250), 1,
-                                RGBA(0, 0, 0, 0.8f), RGBA(0, 0, 0, 0.8f), none, none);
-        gsKit_prim_quad_gouraud(gs, 0, 0, W, 0, 0, Y(140), W, Y(140), 1,
-                                RGBA(0, 0, 0, 0.6f), RGBA(0, 0, 0, 0.6f), none, none);
+        grad_x(0, VW * 0.6f, 0.7f);
+        grad_y(VH, 250, 0.8f);
+        grad_y(0, 140, 0.6f);
 
         /* вкладки по центру */
         {
