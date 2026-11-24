@@ -1754,7 +1754,7 @@ static void go_item(int p, int i, char *lab, size_t ln, char *val, size_t vn) {
         if (i < GSM_N) {
             if (i == 0) snprintf(lab, ln, "%s", T(L_OFF));
             else snprintf(lab, ln, "%s", GSM_NAME[i - 1]);
-            if (c->gsm == i) snprintf(val, vn, "▶");
+            if (c->gsm == i) snprintf(val, vn, "\xE2\x80\xA2");
         } else snprintf(lab, ln, "%s", T(L_BACK));
     } else {
         if (i == 0) { snprintf(lab, ln, "%s", T(L_VMC)); snprintf(val, vn, "%s", c->vmc ? T(L_ON) : T(L_OFF)); }
@@ -2743,10 +2743,10 @@ static void draw_intro(void) {
 static const char *const SRC_NAME[5] = { "USB", "MX4SIO", "ETH", "HDD", "iLink" };
 
 /* ---------- Запуск игры: анимация ---------- */
-#define LAUNCH_SCALE_T  1.0f     /* секунд на увеличение иконки */
+#define LAUNCH_FADE_T   0.5f     /* секунд на появление обложки */
 #define LAUNCH_TOTAL_T  4.0f     /* общая длительность до запуска */
 
-typedef struct { int active; float t; Game *g; } Launch;
+typedef struct { int active; float t; Game *g; GSTEXTURE cover; int cover_ok; } Launch;
 static Launch launch;
 
 static void launch_game(Game *g) {
@@ -2755,44 +2755,65 @@ static void launch_game(Game *g) {
     (void)g;
     toast(T(L_LAUNCHSOON));
 }
+static void launch_cancel(void) {
+    launch.active = 0;
+    free_tex(&launch.cover);
+    launch.cover_ok = 0;
+    sfx(FX_BACK);
+}
+/* загружаем обложку игры (_COV, иначе _SQR / _ICO) без обрезки, в исходном соотношении */
+static void launch_load_cover(Game *g) {
+    char p[128];
+    launch.cover_ok = 0;
+    memset(&launch.cover, 0, sizeof launch.cover);
+    if (!g->id[0]) return;
+    for (int k = 0; k < 3; k++) {
+        snprintf(p, sizeof p, ROOT "ART/%s_%s.png", g->id, ICO_SUF[k]);
+        if (load_png_ex(&launch.cover, p, gs->Width, gs->Height, 0) == 0) {
+            launch.cover_ok = 1;
+            return;
+        }
+    }
+}
 static void launch_start(int idx) {
     launch.active = 1;
     launch.t = 0;
     launch.g = &games[idx];
+    launch_load_cover(launch.g);
     sfx(FX_SELECT);
 }
 static void launch_update(void) {
     launch.t += dt;
     if (launch.t >= LAUNCH_TOTAL_T) {
         launch.active = 0;
+        free_tex(&launch.cover);
+        launch.cover_ok = 0;
         launch_game(launch.g);
     }
 }
 static void draw_launch(void) {
     Game *g = launch.g;
     float t = launch.t;
-    gsKit_prim_sprite(gs, 0, 0, gs->Width, gs->Height, 6, RGBA(0, 0, 0, 1));
+    gsKit_prim_sprite(gs, 0, 0, gs->Width, gs->Height, 6, RGBA(0x08, 0x0C, 0x18, 1));
 
-    float e = ease_out(clampf(t / LAUNCH_SCALE_T, 0, 1));
-    float maxd = (float)(gs->Width > gs->Height ? gs->Width : gs->Height);
-    float size = lerpf((float)gs->Height * 0.14f, maxd * 1.06f, e);
-    float cx = gs->Width * 0.5f, cy = gs->Height * 0.5f, hw = size * 0.5f;
-
-    GSTEXTURE *ic = (g->icon_state == 1) ? &g->icon : (noicon_tex.Mem ? &noicon_tex : NULL);
-    if (ic) {
-        gsKit_TexManager_bind(gs, ic);
-        gsKit_prim_sprite_texture(gs, ic, cx - hw, cy - hw, 0, 0, cx + hw, cy + hw,
-                                  ic->Width, ic->Height, 1, RGBA(0x80, 0x80, 0x80, 1));
+    float a = smooth01(clampf(t / LAUNCH_FADE_T, 0, 1));
+    if (launch.cover_ok && launch.cover.Mem) {
+        GSTEXTURE *c = &launch.cover;
+        float maxw = gs->Width * 0.8f, maxh = gs->Height * 0.68f;
+        float sc = fminf(fminf(maxw / c->Width, maxh / c->Height), 1.0f);
+        float w = c->Width * sc, h = c->Height * sc;
+        float x = (gs->Width - w) * 0.5f, y = gs->Height * 0.16f;
+        gsKit_TexManager_bind(gs, c);
+        gsKit_prim_sprite_texture(gs, c, x, y, 0, 0, x + w, y + h, c->Width, c->Height, 3, RGBA(0x80, 0x80, 0x80, a));
     } else {
-        float vw = size / kx, vh = size / ky;
-        rr_fill((VW - vw) * 0.5f, (VH - vh) * 0.5f, vw, vh, vw * 0.13f, RGBA(0x2A, 0x2E, 0x3A, 1));
-        char ch[2] = { (g->name[0] >= 32 && g->name[0] < 127) ? g->name[0] : '?', 0 };
-        text_c(VW * 0.5f, VH * 0.5f - 14, 40, TXT(255, 255, 255, 0.7f), ch);
+        char nm[96];
+        fit_text(nm, sizeof nm, g->name, 30, VW - 80);
+        text_c(VW * 0.5f, VH * 0.42f, 30, TXT(255, 255, 255, a), nm);
     }
 
-    if (t > LAUNCH_SCALE_T) {
-        float a = smooth01((t - LAUNCH_SCALE_T) / 0.3f);
-        text_c(VW * 0.5f, VH - 64, 22, TXT(255, 255, 255, a), T(L_LOADING));
+    if (t > LAUNCH_FADE_T) {
+        float la = smooth01((t - LAUNCH_FADE_T) / 0.3f);
+        text_c(VW * 0.5f, VH - 64, 22, TXT(255, 255, 255, la), T(L_LOADING));
     }
 }
 
@@ -2867,7 +2888,7 @@ int main(int argc, char *argv[]) {
         int nvis = (src == 0) ? ngames : 0;
 
         if (launch.active) {
-            /* анимация запуска: ввод не обрабатываем */
+            if (pressed & PAD_CIRCLE) launch_cancel();
         } else if (intro_on) {
             if (pressed & (PAD_CROSS | PAD_START)) intro_t = t_part() + 3.0f;
         } else if (confirm == 3) {
