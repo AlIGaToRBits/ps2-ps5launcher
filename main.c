@@ -779,6 +779,9 @@ static int aload_start(ALoad *a, GSTEXTURE *dst, const char *path, int maxw, int
     a->sy = 0; a->dyDone = 0; a->dst = dst; a->active = 1;
     return 0;
 }
+/* Регистр COUNT (CP0, $9) тикает на частоте ядра EE: 294.912 МГц */
+static inline unsigned ee_count(void) { unsigned c; __asm__ volatile("mfc0 %0, $9" : "=r"(c)); return c; }
+#define ALOAD_SLICE_TICKS (294912u * 2u)   /* ~2 мс на один вызов aload_step */
 static void aload_finish_row(ALoad *a, int dy) {
     float *acc = a->acc[dy & 1];
     u32 *o = a->out + (size_t)dy * a->dw;
@@ -825,8 +828,12 @@ static void aload_row(ALoad *a, const unsigned char *src) {
 static int aload_step(ALoad *a, int budget) {
     if (!a->active) return 0;
     if (setjmp(png_jmpbuf(a->png))) { aload_cancel(a); return -1; }
-    while (budget > 0 && a->sy < a->cy + a->ch) {
+    unsigned t0 = ee_count();
+    int first = 1;
+    /* лимит в пикселях сохранён; поверх него время: 1-я строка всегда обрабатывается, дальше - пока не вышли за ~2 мс */
+    while (budget > 0 && a->sy < a->cy + a->ch && (first || (unsigned)(ee_count() - t0) < ALOAD_SLICE_TICKS)) {
         const unsigned char *src;
+        first = 0;
         if (a->full) src = a->full + (size_t)a->sy * a->w * 4;
         else { png_read_row(a->png, a->row, NULL); src = a->row; }
         if (a->sy >= a->cy) aload_row(a, src);
