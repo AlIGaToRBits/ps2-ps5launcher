@@ -1334,13 +1334,15 @@ static void tz_str(char *dst, size_t n) {
 enum {
     L_GAMES, L_APPS, L_FILES, L_SETTINGS, L_SCREEN, L_SOUND, L_SAVE, L_RESTART, L_EXIT, L_POWEROFF,
     L_LANGUAGE, L_TZ, L_CLOCKFMT, L_VIDEO, L_ASPECT, L_BACK, L_VOLUME, L_MUSIC, L_EFFECTS, L_TRACK,
-    L_ON, L_OFF, L_UNSAVED, L_SAVED, L_SAVEFAIL, L_NOGAMES, L_SRCSOON, L_LAUNCHSOON, L_SOON_PAGE,
+    L_ON, L_OFF, L_UNSAVED, L_SAVED, L_SAVEFAIL, L_NOGAMES, L_SRCSOON, L_LAUNCHSOON, L_SOON_PAGE, L_LOADING,
     L_ASK_EXIT, L_ASK_POWER, L_YES, L_NO, L_NEEDRESTART, L_NOFONT, L_NOTRACKS, L_NOPOWEROFF,
     L_RESTARTFAIL, L_SOUNDSOON, L_HINT_GAMES, L_HINT_MENU, L_HINT_CONFIRM, L_PLAY,
     L_KEEPVIDEO, L_REVERTIN, L_NOAUDIO, L_MUSICVOL, L_FXVOL,
     L_STORAGE, L_NODEV, L_GAMESN, L_APPSN, L_NOAPPS, L_SCANNING, L_FOUND, L_EMPTYDIR, L_ACTIONS, L_COPY, L_CUT, L_PASTE, L_DELETE,
     L_CANCEL, L_ASKDEL, L_CLIPCOPY, L_CLIPMOVE, L_OPDONE, L_OPFAIL, L_CANCELLED, L_COPYING, L_MOVING, L_DELETING, L_ELFFAIL,
-    L_HINT_DEVS, L_HINT_APPS, L_HINT_FILES, L_HINT_CANCEL, L_INTOSELF, L_COPIED, L_MARKED, L_CLEAR, L_FREEKB, L_COUNT
+    L_HINT_DEVS, L_HINT_APPS, L_HINT_FILES, L_HINT_CANCEL, L_INTOSELF, L_COPIED, L_MARKED, L_CLEAR, L_FREEKB,
+    L_GAMEOPT, L_MODES, L_GSM, L_VMC, L_VMC_SIZE, L_MODE, L_MODE1, L_MODE2, L_MODE3, L_MODE4, L_MODE5, L_MODE6,
+    L_COUNT
 };
 static const char *const tr_tab[L_COUNT][2] = {
     [L_GAMES]       = { "Games", "Игры" },
@@ -1371,6 +1373,7 @@ static const char *const tr_tab[L_COUNT][2] = {
     [L_NOGAMES]     = { "No games in mass:/DVD or mass:/CD", "Нет игр в mass:/DVD и mass:/CD" },
     [L_SRCSOON]     = { "This source is not supported yet", "Этот источник пока не поддерживается" },
     [L_LAUNCHSOON]  = { "Game launch will be added later", "Запуск игр будет добавлен позже" },
+    [L_LOADING]     = { "Loading...", "Загрузка..." },
     [L_SOON_PAGE]   = { "This section is coming in a later update", "Раздел появится в одном из следующих обновлений" },
     [L_ASK_EXIT]    = { "Exit to the PS2 menu?", "Выйти в меню PS2?" },
     [L_ASK_POWER]   = { "Power off the console?", "Выключить консоль?" },
@@ -1428,6 +1431,18 @@ static const char *const tr_tab[L_COUNT][2] = {
     [L_CLEAR]       = { "Clear clipboard and marks", "Сбросить буфер и отметки" },
     [L_NOAUDIO]     = { "Audio is not available", "Звук недоступен" },
     [L_REVERTIN]    = { "Reverting in %d s if no answer", "Автоотмена через %d с, если не ответить" },
+    [L_GAMEOPT]     = { "Game settings", "Настройки игры" },
+    [L_MODES]       = { "Compatibility modes", "Режимы совместимости" },
+    [L_GSM]         = { "GSM", "GSM" },
+    [L_VMC]         = { "Virtual memory card", "Виртуальная карта памяти" },
+    [L_VMC_SIZE]    = { "Card size", "Размер карты" },
+    [L_MODE]        = { "Mode", "Режим" },
+    [L_MODE1]       = { "Accurate reads", "Точное чтение" },
+    [L_MODE2]       = { "Synchronous reads", "Синхронное чтение" },
+    [L_MODE3]       = { "Unhook syscalls", "Отключение перехвата" },
+    [L_MODE4]       = { "Skip videos", "Пропуск видео" },
+    [L_MODE5]       = { "Emulate DVD-DL", "Эмуляция DVD-DL" },
+    [L_MODE6]       = { "Disable IGR", "Отключение IGR" },
 };
 #define T(id) (tr_tab[(id)][cfg.lang ? 1 : 0])
 
@@ -1654,6 +1669,161 @@ static void draw_confirm(void) {
     }
     text_c(VW * 0.5f, y + 28, 22, TXT(255, 255, 255, 1), confirm == 1 ? T(L_ASK_EXIT) : T(L_ASK_POWER));
     text_c(VW * 0.5f, y + 82, 17, TXT(255, 255, 255, 0.75f), T(L_HINT_CONFIRM));
+}
+
+/* ---------- Настройки игры (Треугольник): Mode 1-6, GSM, VMC ---------- */
+#define GSM_N 7                                /* Off + 6 режимов */
+static const char *const GSM_NAME[6] = { "NTSC", "PAL", "480p", "576p", "720p", "1080i" };
+
+typedef struct {
+    int modes[6];                             /* Mode 1-6: вкл/выкл */
+    int gsm;                                  /* 0 = выкл, 1..6 = режим */
+    int vmc;                                  /* 0/1 */
+    int vmc_mb;                               /* 8/16/32/64 */
+} GameCfg;
+
+static GameCfg gcfg[MAX_GAMES];
+static int go_pg, go_cur[4], go_open, go_idx;
+static float go_anim;
+
+static void gcfg_default(GameCfg *c) { memset(c, 0, sizeof *c); c->vmc_mb = 8; }
+static int gcfg_dirty(const GameCfg *c) {
+    for (int i = 0; i < 6; i++) if (c->modes[i]) return 1;
+    return c->gsm || c->vmc || c->vmc_mb != 8;
+}
+static void gcfg_load(void) {
+    char path[160], line[200];
+    int i;
+    for (i = 0; i < ngames; i++) gcfg_default(&gcfg[i]);
+    snprintf(path, sizeof path, "%s/gameopts.cfg", app_dir);
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    while (fgets(line, sizeof line, f)) {
+        char *p = trim(line);
+        char id[16], mm[8];
+        int gsm = 0, vmc = 0, mb = 8;
+        if (!*p || *p == '#' || *p == ';') continue;
+        if (sscanf(p, "%15[^|]|%7[01]|%d|%d|%d", id, mm, &gsm, &vmc, &mb) < 2) continue;
+        for (i = 0; i < ngames; i++)
+            if (games[i].id[0] && !strcmp(games[i].id, id)) {
+                GameCfg *c = &gcfg[i];
+                gcfg_default(c);
+                for (int k = 0; k < 6 && mm[k]; k++) c->modes[k] = (mm[k] == '1');
+                c->gsm = gsm < 0 ? 0 : (gsm > GSM_N - 1 ? GSM_N - 1 : gsm);
+                c->vmc = vmc != 0;
+                c->vmc_mb = (mb == 16 || mb == 32 || mb == 64) ? mb : 8;
+                break;
+            }
+    }
+    fclose(f);
+}
+static int gcfg_save(void) {
+    char path[160];
+    snprintf(path, sizeof path, "%s/gameopts.cfg", app_dir);
+    FILE *f = fopen(path, "w");
+    if (!f) return -1;
+    fprintf(f, "# PS5L per-game options\n");
+    for (int i = 0; i < ngames; i++) {
+        if (!games[i].id[0] || !gcfg_dirty(&gcfg[i])) continue;
+        fprintf(f, "%s|", games[i].id);
+        for (int k = 0; k < 6; k++) fputc(gcfg[i].modes[k] ? '1' : '0', f);
+        fprintf(f, "|%d|%d|%d\n", gcfg[i].gsm, gcfg[i].vmc, gcfg[i].vmc_mb);
+    }
+    int bad = ferror(f);
+    fclose(f);
+    return bad ? -1 : 0;
+}
+
+static int go_count(int p) { return p == 0 ? 4 : p == 1 ? 7 : p == 2 ? GSM_N + 1 : 3; }
+static const char *go_title(int p) {
+    return p == 0 ? T(L_GAMEOPT) : p == 1 ? T(L_MODES) : p == 2 ? T(L_GSM) : T(L_VMC);
+}
+static void go_item(int p, int i, char *lab, size_t ln, char *val, size_t vn) {
+    GameCfg *c = &gcfg[go_idx];
+    lab[0] = val[0] = 0;
+    if (p == 0) {
+        const char *names[4] = { T(L_MODES), T(L_GSM), T(L_VMC), T(L_BACK) };
+        snprintf(lab, ln, "%s", names[i]);
+    } else if (p == 1) {
+        if (i < 6) {
+            const char *mn[6] = { T(L_MODE1), T(L_MODE2), T(L_MODE3), T(L_MODE4), T(L_MODE5), T(L_MODE6) };
+            snprintf(lab, ln, "%s %d · %s", T(L_MODE), i + 1, mn[i]);
+            snprintf(val, vn, "%s", c->modes[i] ? T(L_ON) : T(L_OFF));
+        } else snprintf(lab, ln, "%s", T(L_BACK));
+    } else if (p == 2) {
+        if (i < GSM_N) {
+            if (i == 0) snprintf(lab, ln, "%s", T(L_OFF));
+            else snprintf(lab, ln, "%s", GSM_NAME[i - 1]);
+            if (c->gsm == i) snprintf(val, vn, "▶");
+        } else snprintf(lab, ln, "%s", T(L_BACK));
+    } else {
+        if (i == 0) { snprintf(lab, ln, "%s", T(L_VMC)); snprintf(val, vn, "%s", c->vmc ? T(L_ON) : T(L_OFF)); }
+        else if (i == 1) { snprintf(lab, ln, "%s", T(L_VMC_SIZE)); snprintf(val, vn, "%d MB", c->vmc_mb); }
+        else snprintf(lab, ln, "%s", T(L_BACK));
+    }
+}
+static void go_adjust(int p, int i, int dir) {
+    GameCfg *c = &gcfg[go_idx];
+    if (p == 1 && i < 6) c->modes[i] ^= 1;
+    else if (p == 2 && i < GSM_N) c->gsm = (c->gsm + dir + GSM_N) % GSM_N;
+    else if (p == 3) {
+        if (i == 0) c->vmc ^= 1;
+        else if (i == 1) {
+            static const int mb[4] = { 8, 16, 32, 64 };
+            int k = 0;
+            while (k < 3 && c->vmc_mb != mb[k]) k++;
+            c->vmc_mb = mb[(k + dir + 4) % 4];
+        }
+    }
+}
+static void go_press(int p, int i) {
+    if (p == 0) {
+        if (i == 3) go_open = 0;
+        else { go_pg = i + 1; go_cur[go_pg] = 0; }
+    } else if (p == 1) {
+        if (i == 6) go_pg = 0;
+        else go_adjust(p, i, 1);
+    } else if (p == 2) {
+        if (i == GSM_N) go_pg = 0;
+        else gcfg[go_idx].gsm = i;
+    } else {
+        if (i == 2) go_pg = 0;
+        else go_adjust(p, i, 1);
+    }
+}
+static void draw_gameopts(float a) {
+    gsKit_prim_sprite(gs, 0, 0, gs->Width, gs->Height, 4, RGBA(0, 0, 0, 0.62f * a));
+    int n = go_count(go_pg), vis = n > 7 ? 7 : n, first = 0;
+    if (n > vis) { first = go_cur[go_pg] - vis / 2; if (first < 0) first = 0; if (first > n - vis) first = n - vis; }
+    float rowh = 38, pw = 560, px = (VW - pw) * 0.5f, py = 46;
+    float ph = 100 + vis * rowh + 14, slide = (1.0f - a) * 26;
+    rr_fill(px, py + slide, pw, ph, 16, RGBA(0x12, 0x16, 0x24, 1.0f * a));
+    text(px + 30, py + slide + 22, 22, TXT(255, 255, 255, a), go_title(go_pg));
+    {
+        char gname[96];
+        fit_text(gname, sizeof gname, games[go_idx].name, 17, pw - 60);
+        text(px + 30, py + slide + 50, 17, TXT(170, 175, 195, 0.9f * a), gname);
+    }
+    fill_rect(px + 28, py + slide + 76, pw - 56, 2, RGBA(255, 255, 255, 0.18f * a));
+    for (int k = 0; k < vis; k++) {
+        int i = first + k;
+        float y = py + slide + 86 + k * rowh;
+        char raw[96], lab[96], val[40];
+        go_item(go_pg, i, raw, sizeof raw, val, sizeof val);
+        fit_text(lab, sizeof lab, raw, 22, pw - 140);
+        if (i == go_cur[go_pg]) {
+            rr_fill(px + 14, y, pw - 28, rowh - 6, 10, RGBA(255, 255, 255, 0.17f * a));
+            rr_fill(px + 14, y + 6, 4, rowh - 18, 2, RGBA(255, 255, 255, 0.9f * a));
+        }
+        float ta = (i == go_cur[go_pg]) ? 1.0f : 0.72f;
+        text(px + 34, y + 2, 22, TXT(255, 255, 255, ta * a), lab);
+        if (val[0]) text_r(px + pw - 34, y + 2, 22, TXT(255, 255, 255, ta * a), val);
+    }
+    if (n > vis) {
+        float th = (vis * rowh - 12) * vis / (float)n, ty = py + slide + 86 + (vis * rowh - 12 - th) * first / (float)(n - vis);
+        fill_rect(px + pw - 14, ty, 3, th, RGBA(255, 255, 255, 0.45f * a));
+    }
+    text_c(VW * 0.5f, VH - 36, 17, TXT(255, 255, 255, 0.75f * a), T(L_HINT_MENU));
 }
 
 /* ---------- Устройства, приложения (все ELF на устройстве), файловый менеджер ---------- */
@@ -2572,6 +2742,60 @@ static void draw_intro(void) {
 /* ---------- Главный цикл ---------- */
 static const char *const SRC_NAME[5] = { "USB", "MX4SIO", "ETH", "HDD", "iLink" };
 
+/* ---------- Запуск игры: анимация ---------- */
+#define LAUNCH_SCALE_T  1.0f     /* секунд на увеличение иконки */
+#define LAUNCH_TOTAL_T  4.0f     /* общая длительность до запуска */
+
+typedef struct { int active; float t; Game *g; } Launch;
+static Launch launch;
+
+static void launch_game(Game *g) {
+    /* Фаза 2: здесь будет вызов движка OPL (cdvdman + isofs) для запуска ISO.
+       Пока — заглушка. */
+    (void)g;
+    toast(T(L_LAUNCHSOON));
+}
+static void launch_start(int idx) {
+    launch.active = 1;
+    launch.t = 0;
+    launch.g = &games[idx];
+    sfx(FX_SELECT);
+}
+static void launch_update(void) {
+    launch.t += dt;
+    if (launch.t >= LAUNCH_TOTAL_T) {
+        launch.active = 0;
+        launch_game(launch.g);
+    }
+}
+static void draw_launch(void) {
+    Game *g = launch.g;
+    float t = launch.t;
+    gsKit_prim_sprite(gs, 0, 0, gs->Width, gs->Height, 6, RGBA(0, 0, 0, 1));
+
+    float e = ease_out(clampf(t / LAUNCH_SCALE_T, 0, 1));
+    float maxd = (float)(gs->Width > gs->Height ? gs->Width : gs->Height);
+    float size = lerpf((float)gs->Height * 0.14f, maxd * 1.06f, e);
+    float cx = gs->Width * 0.5f, cy = gs->Height * 0.5f, hw = size * 0.5f;
+
+    GSTEXTURE *ic = (g->icon_state == 1) ? &g->icon : (noicon_tex.Mem ? &noicon_tex : NULL);
+    if (ic) {
+        gsKit_TexManager_bind(gs, ic);
+        gsKit_prim_sprite_texture(gs, ic, cx - hw, cy - hw, 0, 0, cx + hw, cy + hw,
+                                  ic->Width, ic->Height, 1, RGBA(0x80, 0x80, 0x80, 1));
+    } else {
+        float vw = size / kx, vh = size / ky;
+        rr_fill((VW - vw) * 0.5f, (VH - vh) * 0.5f, vw, vh, vw * 0.13f, RGBA(0x2A, 0x2E, 0x3A, 1));
+        char ch[2] = { (g->name[0] >= 32 && g->name[0] < 127) ? g->name[0] : '?', 0 };
+        text_c(VW * 0.5f, VH * 0.5f - 14, 40, TXT(255, 255, 255, 0.7f), ch);
+    }
+
+    if (t > LAUNCH_SCALE_T) {
+        float a = smooth01((t - LAUNCH_SCALE_T) / 0.3f);
+        text_c(VW * 0.5f, VH - 64, 22, TXT(255, 255, 255, a), T(L_LOADING));
+    }
+}
+
 int main(int argc, char *argv[]) {
     iop_init();
     pads_open();
@@ -2595,6 +2819,7 @@ int main(int argc, char *argv[]) {
     scan_dir("DVD", 0);
     scan_dir("CD", 1);
     qsort(games, ngames, sizeof(Game), cmp_game);
+    gcfg_load();
     scan_tracks();
     audio_init();
     fe = malloc(sizeof(FEnt) * MAXF);
@@ -2641,7 +2866,9 @@ int main(int argc, char *argv[]) {
         int fD = repeat_fire(btn & PAD_DOWN,  pressed & PAD_DOWN,  &hold[3]);
         int nvis = (src == 0) ? ngames : 0;
 
-        if (intro_on) {
+        if (launch.active) {
+            /* анимация запуска: ввод не обрабатываем */
+        } else if (intro_on) {
             if (pressed & (PAD_CROSS | PAD_START)) intro_t = t_part() + 3.0f;
         } else if (confirm == 3) {
             if (pressed & PAD_CROSS) { sfx(FX_SELECT); trial_keep(); }
@@ -2663,6 +2890,19 @@ int main(int argc, char *argv[]) {
                 else set_open = 0;
             }
             if (pressed & PAD_START) { set_open = 0; sfx(FX_BACK); }
+        } else if (go_open) {
+            int n = go_count(go_pg);
+            if (fU) { go_cur[go_pg] = (go_cur[go_pg] + n - 1) % n; sfx(FX_MOVE); }
+            if (fD) { go_cur[go_pg] = (go_cur[go_pg] + 1) % n; sfx(FX_MOVE); }
+            if (fL) { go_adjust(go_pg, go_cur[go_pg], -1); sfx(FX_MOVE); }
+            if (fR) { go_adjust(go_pg, go_cur[go_pg], +1); sfx(FX_MOVE); }
+            if (pressed & PAD_CROSS) { sfx(FX_SELECT); go_press(go_pg, go_cur[go_pg]); }
+            if (pressed & PAD_CIRCLE) {
+                sfx(FX_BACK);
+                if (go_pg != 0) go_pg = 0;
+                else { go_open = 0; gcfg_save(); }
+            }
+            if (pressed & PAD_START) { go_open = 0; gcfg_save(); sfx(FX_BACK); }
         } else {
             if (pressed & PAD_START) { set_open = 1; pg = PG_ROOT; sfx(FX_OPEN); }
             if (pressed & PAD_L1) { tab = (tab + 2) % 3; tabFade.v = 0; anim_to(&tabFade, 1); sfx(FX_TAB); }
@@ -2692,7 +2932,8 @@ int main(int argc, char *argv[]) {
                     aload_cancel(&ld_bg); aload_cancel(&ld_lgo);
                     lgo_state = 0; bg_state = 0; lgoA.v = lgoA.t = 0; anim_to(&bgA, 0);
                 }
-                if ((pressed & PAD_CROSS) && nvis > 0) { sfx(FX_SELECT); toast(T(L_LAUNCHSOON)); }
+                if ((pressed & PAD_CROSS) && nvis > 0) { launch_start(sel); }
+                if ((pressed & PAD_TRIANGLE) && nvis > 0) { go_idx = sel; go_pg = 0; go_cur[0] = 0; go_open = 1; sfx(FX_OPEN); }
             } else if (tab == 1) apps_input(pressed, fL, fR, fU, fD);
             else files_input(pressed, fL, fR, fU, fD);
         }
@@ -2700,6 +2941,7 @@ int main(int argc, char *argv[]) {
         idle++;
 
         /* --- анимации и состояние --- */
+        if (launch.active) launch_update();
         if (intro_on) {
             if (!intro_snd && intro_t >= 0.2f) { intro_snd = 1; sfx(FX_INTRO); }
             intro_update();
@@ -2709,6 +2951,8 @@ int main(int argc, char *argv[]) {
         }
         if (set_open) set_anim = clampf(set_anim + dt / 0.55f, 0, 1);
         else          set_anim = clampf(set_anim - dt / 0.30f, 0, 1);
+        if (go_open)  go_anim = clampf(go_anim + dt / 0.45f, 0, 1);
+        else          go_anim = clampf(go_anim - dt / 0.25f, 0, 1);
         if (toast_t > 0) toast_t -= dt;
         if (trial_on) { trial_left -= dt; if (trial_left <= 0) trial_revert(); }
         if (frame % 30 == 0) clock_update();
@@ -2893,6 +3137,7 @@ int main(int argc, char *argv[]) {
             text_c(VW * 0.5f, VH - 36, 17, TXT(255, 255, 255, 0.6f * (1.0f - fminf(set_anim * 2.0f, 1.0f))), tab_hint(tab));
 
         if (set_anim > 0.01f) draw_settings(smooth01((set_anim - 0.35f) / 0.65f));
+        if (go_anim > 0.01f) draw_gameopts(smooth01((go_anim - 0.35f) / 0.65f));
         if (confirm) draw_confirm();
         if (toast_t > 0) {
             float a = clampf(toast_t / 0.4f, 0, 1);
@@ -2900,6 +3145,7 @@ int main(int argc, char *argv[]) {
             rr_fill((VW - w) * 0.5f, VH - 82, w, 34, 17, RGBA(0x10, 0x14, 0x22, 0.94f * a));
             text_c(VW * 0.5f, VH - 75, 17, TXT(255, 255, 255, a), toast_msg);
         }
+        if (launch.active) draw_launch();
         if (intro_on) draw_intro();
 
         audio_pump();
